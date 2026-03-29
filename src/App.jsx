@@ -393,6 +393,12 @@ function parseInline(text) {
 }
 
 function renderMarkdownLine(line, idx) {
+  if (line.startsWith("##### "))
+    return (
+      <h5 key={idx} className="text-sm font-semibold mt-2 mb-0.5 text-gray-700">
+        {parseInline(line.slice(6))}
+      </h5>
+    );
   if (line.startsWith("#### "))
     return (
       <h4 key={idx} className="text-sm font-bold mt-2 mb-1 text-gray-800">
