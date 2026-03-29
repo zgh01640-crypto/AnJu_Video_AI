@@ -1,5 +1,5 @@
 // ===== SECTION 1: IMPORTS =====
-import { useState, useReducer, useRef, useCallback } from "react";
+import { useState, useReducer, useRef, useCallback, useEffect } from "react";
 
 // ===== SECTION 2: CONSTANTS =====
 const DEFAULT_PROMPT = "请分析工程视频，正在进行哪些专业施工，形象进度如何";
@@ -61,6 +61,80 @@ function formatFileSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+// ===== OSS PERSISTENCE UTILITIES =====
+
+async function saveAnalysisToOSS(config, entry) {
+  const json = JSON.stringify({
+    ...entry,
+    timestamp: entry.timestamp instanceof Date ? entry.timestamp.toISOString() : entry.timestamp,
+  });
+  const blob = new Blob([json], { type: "application/json" });
+  const objectKey = `analysis/${encodeURIComponent(entry.videoObjectKey)}.json`;
+  const putUrl = await generateOSSPresignedUrl(config, objectKey, "PUT", 3600, "application/json");
+  const res = await fetch(putUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: blob,
+  });
+  if (!res.ok) throw new Error(`OSS PUT failed: ${res.status}`);
+  return objectKey;
+}
+
+async function updateOSSIndex(config, analysisObjectKey, action = "add") {
+  const indexKey = "analysis/index.json";
+  let currentKeys = [];
+  try {
+    const getUrl = await generateOSSPresignedUrl(config, indexKey, "GET", 60);
+    const res = await fetch(getUrl);
+    if (res.ok) currentKeys = await res.json();
+  } catch { /* first write or network error — start empty */ }
+
+  if (action === "add") {
+    if (!currentKeys.includes(analysisObjectKey)) currentKeys = [analysisObjectKey, ...currentKeys];
+  } else {
+    currentKeys = currentKeys.filter(k => k !== analysisObjectKey);
+  }
+
+  const blob = new Blob([JSON.stringify(currentKeys)], { type: "application/json" });
+  const putUrl = await generateOSSPresignedUrl(config, indexKey, "PUT", 3600, "application/json");
+  const res = await fetch(putUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: blob,
+  });
+  if (!res.ok) throw new Error(`OSS index PUT failed: ${res.status}`);
+}
+
+async function loadOSSHistory(config) {
+  const indexKey = "analysis/index.json";
+  const getUrl = await generateOSSPresignedUrl(config, indexKey, "GET", 300);
+  const indexRes = await fetch(getUrl);
+  if (!indexRes.ok) {
+    if (indexRes.status === 404) return [];
+    throw new Error(`index load failed: ${indexRes.status}`);
+  }
+  const keys = await indexRes.json();
+
+  const results = await Promise.allSettled(
+    keys.map(async (objectKey) => {
+      const entryUrl = await generateOSSPresignedUrl(config, objectKey, "GET", 300);
+      const res = await fetch(entryUrl);
+      if (!res.ok) throw new Error(`entry ${objectKey} HTTP ${res.status}`);
+      const data = await res.json();
+      return { ...data, timestamp: new Date(data.timestamp) };
+    })
+  );
+  return results
+    .filter(r => r.status === "fulfilled")
+    .map(r => r.value)
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+}
+
+async function deleteOSSHistoryEntry(config, entry) {
+  const objectKey = `analysis/${encodeURIComponent(entry.videoObjectKey)}.json`;
+  await updateOSSIndex(config, objectKey, "remove");
+}
+
 // ===== SECTION 4: REDUCER =====
 
 // 从 window._ENV_ 读取运行时环境变量（Docker 注入），回退到空字符串
@@ -102,6 +176,21 @@ const initialState = {
 
   history: [],
   activeHistoryIdx: 0,
+
+  // v1.1: OSS 持久化历史
+  ossHistory: {
+    status: "idle", // 'idle'|'loading'|'loaded'|'error'
+    entries: [],
+    errorMessage: "",
+  },
+  historyDrawerOpen: false,
+  persistError: "",
+
+  // v1.1: 多视频上传队列
+  queue: {
+    items: [],   // QueueItem[]
+    activeId: null,
+  },
 };
 
 function appReducer(state, action) {
@@ -167,6 +256,7 @@ function appReducer(state, action) {
         analysis: { ...initialState.analysis },
         history: [],
         activeHistoryIdx: 0,
+        queue: { items: [], activeId: null },
       };
 
     case "SET_PROMPT":
@@ -247,12 +337,186 @@ function appReducer(state, action) {
     case "SELECT_HISTORY_TAB":
       return { ...state, activeHistoryIdx: action.payload };
 
+    // ===== v1.1: PERSISTENCE ACTIONS =====
+    case "OSS_SAVE_ERROR":
+      return { ...state, persistError: action.payload.message };
+    case "CLEAR_PERSIST_ERROR":
+      return { ...state, persistError: "" };
+
+    // ===== v1.1: HISTORY DRAWER ACTIONS =====
+    case "OSS_HISTORY_LOADING":
+      return { ...state, ossHistory: { ...state.ossHistory, status: "loading" } };
+    case "OSS_HISTORY_LOADED":
+      return { ...state, ossHistory: { status: "loaded", entries: action.payload.entries, errorMessage: "" } };
+    case "OSS_HISTORY_ERROR":
+      return { ...state, ossHistory: { ...state.ossHistory, status: "error", errorMessage: action.payload.message } };
+    case "TOGGLE_HISTORY_DRAWER":
+      return { ...state, historyDrawerOpen: !state.historyDrawerOpen };
+    case "CLOSE_HISTORY_DRAWER":
+      return { ...state, historyDrawerOpen: false };
+    case "OSS_HISTORY_ENTRY_DELETED":
+      return {
+        ...state,
+        ossHistory: {
+          ...state.ossHistory,
+          entries: state.ossHistory.entries.filter(e => e.id !== action.payload.id),
+        },
+      };
+    case "RESTORE_FROM_HISTORY": {
+      const { entry, signedPlayUrl } = action.payload;
+      return {
+        ...state,
+        upload: {
+          phase: "done", file: null,
+          objectKey: entry.videoObjectKey,
+          signedPlayUrl,
+          progress: 100, errorCode: null, errorMessage: "",
+        },
+        history: [entry],
+        activeHistoryIdx: 0,
+        historyDrawerOpen: false,
+        analysis: { ...initialState.analysis },
+      };
+    }
+
+    // ===== v1.1: QUEUE ACTIONS =====
+    case "QUEUE_ADD":
+      return { ...state, queue: { items: action.payload.items, activeId: null } };
+    case "QUEUE_ITEM_START":
+      return {
+        ...state,
+        queue: {
+          ...state.queue,
+          activeId: action.payload.id,
+          items: state.queue.items.map(i =>
+            i.id === action.payload.id ? { ...i, status: "uploading" } : i
+          ),
+        },
+      };
+    case "QUEUE_ITEM_PROGRESS":
+      return {
+        ...state,
+        queue: {
+          ...state.queue,
+          items: state.queue.items.map(i =>
+            i.id === action.payload.id ? { ...i, progress: action.payload.progress } : i
+          ),
+        },
+      };
+    case "QUEUE_ITEM_DONE": {
+      const { id, signedPlayUrl: qSignedUrl } = action.payload;
+      const doneItem = state.queue.items.find(i => i.id === id);
+      return {
+        ...state,
+        queue: {
+          items: state.queue.items.map(i =>
+            i.id === id ? { ...i, status: "done", progress: 100 } : i
+          ),
+          activeId: null,
+        },
+        upload: {
+          phase: "done",
+          file: doneItem?.file || null,
+          objectKey: doneItem?.objectKey || null,
+          signedPlayUrl: qSignedUrl,
+          progress: 100,
+          errorCode: null,
+          errorMessage: "",
+        },
+        analysis: { ...initialState.analysis },
+      };
+    }
+    case "QUEUE_ITEM_FAILED":
+      return {
+        ...state,
+        queue: {
+          items: state.queue.items.map(i =>
+            i.id === action.payload.id
+              ? { ...i, status: "failed", errorMessage: action.payload.errorMessage }
+              : i
+          ),
+          activeId: null,
+        },
+      };
+    case "QUEUE_CLEAR":
+      return { ...state, queue: { items: [], activeId: null } };
+
     default:
       return state;
   }
 }
 
 // ===== SECTION 5: CUSTOM HOOKS =====
+
+function useOSSPersistence() {
+  const persistEntry = useCallback(async (config, entry, dispatch) => {
+    try {
+      const objectKey = await saveAnalysisToOSS(config, entry);
+      await updateOSSIndex(config, objectKey, "add");
+    } catch (err) {
+      dispatch({ type: "OSS_SAVE_ERROR", payload: { message: err.message } });
+    }
+  }, []);
+
+  const loadHistory = useCallback(async (config, dispatch) => {
+    dispatch({ type: "OSS_HISTORY_LOADING" });
+    try {
+      const entries = await loadOSSHistory(config);
+      dispatch({ type: "OSS_HISTORY_LOADED", payload: { entries } });
+    } catch (err) {
+      dispatch({ type: "OSS_HISTORY_ERROR", payload: { message: err.message } });
+    }
+  }, []);
+
+  const deleteEntry = useCallback(async (config, entry, dispatch) => {
+    try {
+      await deleteOSSHistoryEntry(config, entry);
+      dispatch({ type: "OSS_HISTORY_ENTRY_DELETED", payload: { id: entry.id } });
+    } catch (err) {
+      dispatch({ type: "OSS_SAVE_ERROR", payload: { message: err.message } });
+    }
+  }, []);
+
+  return { persistEntry, loadHistory, deleteEntry };
+}
+
+function useQueueProcessor(state, dispatch) {
+  const { upload: ossUpload } = useOSSUpload();
+
+  useEffect(() => {
+    const { items, activeId } = state.queue;
+    if (activeId !== null) return;
+    const next = items.find(i => i.status === "waiting");
+    if (!next) return;
+
+    dispatch({ type: "QUEUE_ITEM_START", payload: { id: next.id } });
+
+    const proxyDispatch = (action) => {
+      if (action.type === "UPLOAD_PROGRESS") {
+        dispatch({ type: "QUEUE_ITEM_PROGRESS", payload: { id: next.id, progress: action.payload } });
+      } else if (action.type !== "UPLOAD_START") {
+        dispatch(action);
+      }
+    };
+
+    ossUpload(state.config, next.file, next.objectKey, proxyDispatch)
+      .then(async () => {
+        const signedPlayUrl = await generateOSSPresignedUrl(state.config, next.objectKey, "GET", 7200);
+        dispatch({ type: "QUEUE_ITEM_DONE", payload: { id: next.id, signedPlayUrl } });
+      })
+      .catch(err => {
+        dispatch({
+          type: "QUEUE_ITEM_FAILED",
+          payload: {
+            id: next.id,
+            errorMessage: err.message === "CORS_ERROR"
+              ? "上传失败：CORS 未配置"
+              : `上传失败：${err.message}`,
+          },
+        });
+      });
+  }, [state.queue.items, state.queue.activeId]);
+}
 
 function useOSSUpload() {
   const upload = useCallback(async (config, file, objectKey, dispatch) => {
@@ -510,20 +774,20 @@ function ConfigPanel({ config, onSave, onToggle }) {
 }
 
 // --- Upload Zone ---
-function UploadZone({ onFileSelected, uploadError, onClearError }) {
+function UploadZone({ onFilesSelected, uploadError, onClearError }) {
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef(null);
 
   function handleDrop(e) {
     e.preventDefault();
     setDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (file) onFileSelected(file);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length > 0) onFilesSelected(files);
   }
 
   function handleChange(e) {
-    const file = e.target.files[0];
-    if (file) onFileSelected(file);
+    const files = Array.from(e.target.files);
+    if (files.length > 0) onFilesSelected(files);
     e.target.value = "";
   }
 
@@ -550,16 +814,157 @@ function UploadZone({ onFileSelected, uploadError, onClearError }) {
         <p className="text-gray-600 font-medium text-center px-4">
           拖拽视频文件至此，或点击选择
         </p>
-        <p className="text-gray-400 text-sm mt-1">支持 MP4、MOV、AVI，最大 200MB</p>
+        <p className="text-gray-400 text-sm mt-1">支持 MP4、MOV、AVI，最大 200MB，可多选</p>
       </div>
       <input
         ref={inputRef}
         type="file"
+        multiple
         accept=".mp4,.mov,.avi,video/mp4,video/quicktime,video/x-msvideo"
         onChange={handleChange}
         className="hidden"
       />
     </div>
+  );
+}
+
+// --- Queue Panel ---
+function QueuePanel({ items, onClear }) {
+  if (items.length === 0) return null;
+  const statusConfig = {
+    waiting:   { text: "等待中", cls: "bg-gray-100 text-gray-500" },
+    uploading: { text: "上传中", cls: "bg-blue-100 text-blue-700" },
+    done:      { text: "完成 ✓", cls: "bg-green-100 text-green-700" },
+    failed:    { text: "失败 ✗", cls: "bg-red-100 text-red-700" },
+  };
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl p-3">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-sm font-medium text-gray-700">上传队列（{items.length} 个文件）</span>
+        <button onClick={onClear} className="text-xs text-gray-400 hover:text-gray-600">清空</button>
+      </div>
+      <div className="flex flex-col gap-2">
+        {items.map(item => {
+          const sc = statusConfig[item.status];
+          return (
+            <div key={item.id} className="flex flex-col gap-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-600 truncate max-w-[200px]">{item.file?.name}</span>
+                <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${sc.cls}`}>{sc.text}</span>
+              </div>
+              {item.status === "uploading" && (
+                <div className="w-full bg-gray-200 rounded-full h-1">
+                  <div className="bg-blue-500 h-1 rounded-full transition-all" style={{ width: `${item.progress}%` }} />
+                </div>
+              )}
+              {item.status === "failed" && (
+                <p className="text-xs text-red-500">{item.errorMessage}</p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// --- History Drawer ---
+function HistoryDrawer({ open, ossHistory, onClose, onRestore, onDelete }) {
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const grouped = {};
+  (ossHistory.entries || []).forEach(entry => {
+    const key = new Date(entry.timestamp).toLocaleDateString("zh-CN");
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(entry);
+  });
+
+  return (
+    <>
+      {/* Backdrop */}
+      {open && (
+        <div
+          className="fixed inset-0 bg-black bg-opacity-30 z-40"
+          onClick={onClose}
+        />
+      )}
+      {/* Drawer */}
+      <div className={`fixed right-0 top-0 h-full w-80 bg-white shadow-2xl z-50 flex flex-col transition-transform duration-300
+        ${open ? "translate-x-0" : "translate-x-full"}`}>
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 bg-gray-50">
+          <h2 className="font-semibold text-gray-800">📋 历史分析记录</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto p-3">
+          {ossHistory.status === "loading" && (
+            <div className="flex items-center justify-center h-32 text-gray-400 text-sm">
+              <svg className="animate-spin h-4 w-4 mr-2" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+              </svg>
+              加载中…
+            </div>
+          )}
+          {ossHistory.status === "error" && (
+            <div className="text-red-500 text-sm p-3 bg-red-50 rounded">{ossHistory.errorMessage}</div>
+          )}
+          {(ossHistory.status === "loaded" || ossHistory.status === "idle") && ossHistory.entries.length === 0 && (
+            <div className="text-gray-400 text-sm text-center mt-12">暂无历史记录</div>
+          )}
+          {Object.entries(grouped).map(([date, entries]) => (
+            <div key={date} className="mb-4">
+              <div className="text-xs font-medium text-gray-400 mb-2 px-1">{date}</div>
+              {entries.map(entry => (
+                <div key={entry.id} className="bg-gray-50 rounded-lg p-3 mb-2 border border-gray-100">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs text-gray-400 mb-1">
+                        {new Date(entry.timestamp).toLocaleTimeString("zh-CN")} · {formatElapsed(entry.elapsedMs)}
+                      </p>
+                      <p className="text-sm text-gray-700 line-clamp-2 leading-relaxed">
+                        {(entry.resultText || "").slice(0, 80)}…
+                      </p>
+                    </div>
+                    <div className="flex flex-col gap-1 shrink-0">
+                      <button
+                        onClick={() => onRestore(entry)}
+                        title="恢复"
+                        className="text-xs px-2 py-1 bg-blue-50 text-blue-600 rounded hover:bg-blue-100"
+                      >
+                        恢复
+                      </button>
+                      {confirmDeleteId === entry.id ? (
+                        <div className="flex gap-1">
+                          <button
+                            onClick={() => { onDelete(entry); setConfirmDeleteId(null); }}
+                            className="text-xs px-1.5 py-1 bg-red-500 text-white rounded hover:bg-red-600"
+                          >确认</button>
+                          <button
+                            onClick={() => setConfirmDeleteId(null)}
+                            className="text-xs px-1.5 py-1 bg-gray-200 text-gray-600 rounded"
+                          >取消</button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => setConfirmDeleteId(entry.id)}
+                          title="删除"
+                          className="text-xs px-2 py-1 bg-gray-100 text-gray-500 rounded hover:bg-red-50 hover:text-red-500"
+                        >
+                          删除
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -843,12 +1248,29 @@ export default function App() {
   const timeoutHandleRef = useRef(null);
   const { upload: ossUpload } = useOSSUpload();
   const { analyze: qwenAnalyze } = useQwenAnalysis();
+  const { persistEntry, loadHistory, deleteEntry } = useOSSPersistence();
 
   const isConfigured = Object.values(state.config).every((v) => v.trim() !== "");
   const canAnalyze =
     state.upload.phase === "done" &&
     state.prompt.text.trim() !== "" &&
     state.analysis.status !== "streaming";
+
+  // 启动时从 OSS 加载历史记录
+  useEffect(() => {
+    if (isConfigured) loadHistory(state.config, dispatch);
+  }, []);
+
+  // 队列处理器
+  useQueueProcessor(state, dispatch);
+
+  // persistError 自动清除
+  useEffect(() => {
+    if (state.persistError) {
+      const t = setTimeout(() => dispatch({ type: "CLEAR_PERSIST_ERROR" }), 4000);
+      return () => clearTimeout(t);
+    }
+  }, [state.persistError]);
 
   // --- Handlers ---
 
@@ -857,16 +1279,38 @@ export default function App() {
     dispatch({ type: "CLOSE_CONFIG_PANEL" });
   }
 
-  function handleFileSelected(file) {
-    // Validate type
-    const ext = "." + file.name.split(".").pop().toLowerCase();
-    if (!ALLOWED_TYPES.includes(file.type) && !ALLOWED_EXTS.includes(ext)) {
+  function handleFilesSelected(files) {
+    const validItems = [];
+    const errors = [];
+    for (const file of files) {
+      const ext = "." + file.name.split(".").pop().toLowerCase();
+      if (!ALLOWED_TYPES.includes(file.type) && !ALLOWED_EXTS.includes(ext)) {
+        errors.push(`${file.name}：格式不支持`);
+        continue;
+      }
+      if (file.size > MAX_FILE_SIZE) {
+        errors.push(`${file.name}：超过 200MB`);
+        continue;
+      }
+      validItems.push({
+        id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        file,
+        objectKey: buildOSSObjectKey(file.name),
+        status: "waiting",
+        progress: 0,
+        errorMessage: "",
+      });
+    }
+    if (validItems.length > 0) {
+      dispatch({ type: "QUEUE_ADD", payload: { items: validItems } });
+    }
+    if (errors.length > 0) {
       dispatch({
         type: "UPLOAD_ERROR",
-        payload: {
-          errorCode: "E001",
-          errorMessage: "仅支持 MP4、MOV、AVI 格式，请重新选择",
-        },
+        payload: { errorCode: "E001", errorMessage: errors.join("；") },
+      });
+    }
+  }
       });
       return;
     }
@@ -913,52 +1357,63 @@ export default function App() {
   async function handleAnalyze() {
     if (!canAnalyze) return;
 
-    // Refresh the signed play URL before sending to Qwen
     let freshUrl = state.upload.signedPlayUrl;
     try {
-      freshUrl = await generateOSSPresignedUrl(
-        state.config,
-        state.upload.objectKey,
-        "GET",
-        7200
-      );
-    } catch {
-      // Use existing URL if refresh fails
-    }
+      freshUrl = await generateOSSPresignedUrl(state.config, state.upload.objectKey, "GET", 7200);
+    } catch { /* use existing url */ }
 
     const startedAt = Date.now();
     dispatch({ type: "ANALYSIS_START", payload: { startedAt } });
 
     const ac = new AbortController();
     abortControllerRef.current = ac;
-
     timeoutHandleRef.current = setTimeout(() => {
       ac.abort();
       dispatch({ type: "ANALYSIS_TIMEOUT" });
     }, ANALYSIS_TIMEOUT_MS);
 
+    // trackingDispatch 捕获完整 streamBuffer（避免 stale closure）
+    let localBuffer = "";
+    const trackingDispatch = (action) => {
+      if (action.type === "ANALYSIS_TOKEN") localBuffer += action.payload;
+      dispatch(action);
+    };
+
     try {
-      await qwenAnalyze(
-        state.config,
-        freshUrl,
-        state.prompt.text,
-        dispatch,
-        ac.signal
-      );
+      await qwenAnalyze(state.config, freshUrl, state.prompt.text, trackingDispatch, ac.signal);
       clearTimeout(timeoutHandleRef.current);
-      dispatch({
-        type: "ANALYSIS_DONE",
-        payload: { elapsedMs: Date.now() - startedAt },
-      });
+      const elapsedMs = Date.now() - startedAt;
+      dispatch({ type: "ANALYSIS_DONE", payload: { elapsedMs } });
+
+      // Feature 1: 持久化分析结果到 OSS（fire-and-forget）
+      const entry = {
+        id: `${Date.now()}`,
+        timestamp: new Date(),
+        promptUsed: state.prompt.text,
+        resultText: localBuffer,
+        elapsedMs,
+        videoObjectKey: state.upload.objectKey,
+      };
+      persistEntry(state.config, entry, dispatch);
     } catch (err) {
       clearTimeout(timeoutHandleRef.current);
       if (err.name !== "AbortError") {
-        dispatch({
-          type: "ANALYSIS_ERROR",
-          payload: { errorMessage: err.message },
-        });
+        dispatch({ type: "ANALYSIS_ERROR", payload: { errorMessage: err.message } });
       }
     }
+  }
+
+  async function handleRestoreFromHistory(entry) {
+    let signedPlayUrl = "";
+    try {
+      signedPlayUrl = await generateOSSPresignedUrl(state.config, entry.videoObjectKey, "GET", 7200);
+    } catch { /* restore text only */ }
+    dispatch({ type: "RESTORE_FROM_HISTORY", payload: { entry, signedPlayUrl } });
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  async function handleDeleteHistoryEntry(entry) {
+    await deleteEntry(state.config, entry, dispatch);
   }
 
   function handlePromptChange(text) {
@@ -980,7 +1435,7 @@ export default function App() {
   }
 
   // --- Render ---
-  const { upload, prompt, analysis, history, activeHistoryIdx } = state;
+  const { upload, prompt, analysis, history, activeHistoryIdx, queue } = state;
   const isStreaming = analysis.status === "streaming";
   const uploadErrorMsg =
     upload.phase === "error" || upload.errorCode ? upload.errorMessage : null;
@@ -997,10 +1452,17 @@ export default function App() {
             <div className="hidden sm:flex items-center gap-3 text-xs text-blue-200">
               <span title="AI 分析模型">🤖 qwen-vl-plus</span>
               <span className="text-blue-500">|</span>
-              <span title="OSS 存储"
-                className="max-w-[180px] truncate"
-              >🗄 {state.config.ossRegion}</span>
+              <span title="OSS 存储" className="max-w-[180px] truncate">🗄 {state.config.ossRegion}</span>
             </div>
+          )}
+          {isConfigured && (
+            <button
+              onClick={() => dispatch({ type: "TOGGLE_HISTORY_DRAWER" })}
+              title="历史分析记录"
+              className="text-blue-200 hover:text-white transition-colors text-lg"
+            >
+              📋
+            </button>
           )}
           <button
             onClick={() => dispatch({ type: "TOGGLE_CONFIG_PANEL" })}
@@ -1011,6 +1473,14 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* persist error toast */}
+      {state.persistError && (
+        <div className="bg-orange-50 border-b border-orange-200 px-5 py-2 text-sm text-orange-700 flex justify-between">
+          <span>⚠️ 分析结果保存失败：{state.persistError}</span>
+          <button onClick={() => dispatch({ type: "CLEAR_PERSIST_ERROR" })} className="ml-4 font-bold">×</button>
+        </div>
+      )}
 
       {/* Config Panel */}
       {state.configPanelOpen && (
@@ -1037,7 +1507,7 @@ export default function App() {
               />
             ) : (
               <UploadZone
-                onFileSelected={handleFileSelected}
+                onFilesSelected={handleFilesSelected}
                 uploadError={uploadErrorMsg}
                 onClearError={() => dispatch({ type: "RESET_UPLOAD" })}
               />
@@ -1047,6 +1517,12 @@ export default function App() {
                 progress={upload.progress}
                 filename={upload.file?.name}
                 fileSize={upload.file?.size}
+              />
+            )}
+            {queue.items.length > 0 && (
+              <QueuePanel
+                items={queue.items}
+                onClear={() => dispatch({ type: "QUEUE_CLEAR" })}
               />
             )}
             {upload.phase === "done" && (
@@ -1110,6 +1586,15 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* History Drawer */}
+      <HistoryDrawer
+        open={state.historyDrawerOpen}
+        ossHistory={state.ossHistory}
+        onClose={() => dispatch({ type: "CLOSE_HISTORY_DRAWER" })}
+        onRestore={handleRestoreFromHistory}
+        onDelete={handleDeleteHistoryEntry}
+      />
     </div>
   );
 }
