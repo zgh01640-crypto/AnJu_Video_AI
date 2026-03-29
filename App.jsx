@@ -84,7 +84,7 @@ async function updateOSSIndex(config, analysisObjectKey, action = "add") {
   const indexKey = "analysis/index.json";
   let currentKeys = [];
   try {
-    const getUrl = await generateOSSPresignedUrl(config, indexKey, "GET", 60);
+    const getUrl = await generateOSSPresignedUrl(config, indexKey, "GET", 300);
     const res = await fetch(getUrl);
     if (res.ok) currentKeys = await res.json();
   } catch { /* first write or network error — start empty */ }
