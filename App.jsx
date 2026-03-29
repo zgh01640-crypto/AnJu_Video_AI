@@ -362,6 +362,14 @@ function appReducer(state, action) {
           entries: state.ossHistory.entries.filter(e => e.id !== action.payload.id),
         },
       };
+    case "OSS_HISTORY_ENTRY_ADDED":
+      return {
+        ...state,
+        ossHistory: {
+          ...state.ossHistory,
+          entries: [action.payload.entry, ...state.ossHistory.entries],
+        },
+      };
     case "RESTORE_FROM_HISTORY": {
       const { entry, signedPlayUrl } = action.payload;
       return {
@@ -1352,6 +1360,8 @@ export default function App() {
         elapsedMs,
         videoObjectKey: state.upload.objectKey,
       };
+      // 立即更新本地历史列表，无需等待 OSS 写入
+      dispatch({ type: "OSS_HISTORY_ENTRY_ADDED", payload: { entry } });
       persistEntry(state.config, entry, dispatch);
     } catch (err) {
       clearTimeout(timeoutHandleRef.current);
