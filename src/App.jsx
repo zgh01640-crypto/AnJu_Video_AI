@@ -987,7 +987,7 @@ export default function App() {
               <span className="text-blue-500">|</span>
               <span title="OSS 存储"
                 className="max-w-[180px] truncate"
-              >🗄 {state.config.ossBucket} · {state.config.ossRegion}</span>
+              >🗄 {state.config.ossRegion}</span>
             </div>
           )}
           <button
