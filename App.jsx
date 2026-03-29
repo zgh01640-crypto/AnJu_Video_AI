@@ -135,6 +135,28 @@ async function deleteOSSHistoryEntry(config, entry) {
   await updateOSSIndex(config, objectKey, "remove");
 }
 
+// 从 File 对象提取视频元数据（时长、分辨率）
+function probeVideoFile(file) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.onloadedmetadata = () => {
+      resolve({
+        duration: isFinite(video.duration) ? video.duration : null,
+        width: video.videoWidth || null,
+        height: video.videoHeight || null,
+      });
+      URL.revokeObjectURL(url);
+    };
+    video.onerror = () => {
+      resolve({ duration: null, width: null, height: null });
+      URL.revokeObjectURL(url);
+    };
+    video.src = url;
+  });
+}
+
 // ===== SECTION 4: REDUCER =====
 
 // 从 window._ENV_ 读取运行时环境变量（Docker 注入），回退到空字符串
@@ -872,10 +894,17 @@ function QueuePanel({ items, activeObjectKey, onClear, onSwitch }) {
         {items.map(item => {
           const sc = statusConfig[item.status];
           const isActive = item.objectKey === activeObjectKey;
+          const m = item.meta;
+          const metaStr = [
+            m?.size ? formatFileSize(m.size) : null,
+            m?.duration ? `${Math.floor(m.duration / 60)}:${String(Math.floor(m.duration % 60)).padStart(2, "0")}` : null,
+            m?.width && m?.height ? `${m.width}×${m.height}` : null,
+            m?.lastModified ? new Date(m.lastModified).toLocaleDateString("zh-CN") : null,
+          ].filter(Boolean).join("  ·  ");
           return (
-            <div key={item.id} className={`flex flex-col gap-1 rounded-lg px-2 py-1 ${isActive ? "bg-blue-50 border border-blue-200" : ""}`}>
+            <div key={item.id} className={`flex flex-col gap-1 rounded-lg px-2 py-1.5 ${isActive ? "bg-blue-50 border border-blue-200" : "border border-transparent"}`}>
               <div className="flex items-center justify-between text-xs gap-2">
-                <span className="text-gray-600 truncate max-w-[160px]">{item.file?.name}</span>
+                <span className="text-gray-700 font-medium truncate max-w-[160px]">{item.file?.name}</span>
                 <div className="flex items-center gap-1 shrink-0">
                   {item.status === "done" && !isActive && (
                     <button
@@ -891,6 +920,9 @@ function QueuePanel({ items, activeObjectKey, onClear, onSwitch }) {
                   <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${sc.cls}`}>{sc.text}</span>
                 </div>
               </div>
+              {metaStr && (
+                <p className="text-xs text-gray-400">{metaStr}</p>
+              )}
               {item.status === "uploading" && (
                 <div className="w-full bg-gray-200 rounded-full h-1">
                   <div className="bg-blue-500 h-1 rounded-full transition-all" style={{ width: `${item.progress}%` }} />
@@ -1318,7 +1350,7 @@ export default function App() {
     dispatch({ type: "CLOSE_CONFIG_PANEL" });
   }
 
-  function handleFilesSelected(files) {
+  async function handleFilesSelected(files) {
     const validItems = [];
     const errors = [];
     for (const file of files) {
@@ -1331,6 +1363,7 @@ export default function App() {
         errors.push(`${file.name}：超过 200MB`);
         continue;
       }
+      const meta = await probeVideoFile(file);
       validItems.push({
         id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
         file,
@@ -1338,6 +1371,13 @@ export default function App() {
         status: "waiting",
         progress: 0,
         errorMessage: "",
+        meta: {
+          duration: meta.duration,
+          width: meta.width,
+          height: meta.height,
+          size: file.size,
+          lastModified: file.lastModified,
+        },
       });
     }
     if (validItems.length > 0) {
