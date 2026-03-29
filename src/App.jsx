@@ -276,6 +276,7 @@ const initialState = {
     errorMessage: "",
   },
   historyDrawerOpen: false,
+  historyDrawerProjectFilter: null,  // string | null，null = 不过滤
   persistError: "",
 
   // v1.1: 多视频上传队列
@@ -453,9 +454,11 @@ function appReducer(state, action) {
     case "OSS_HISTORY_ERROR":
       return { ...state, ossHistory: { ...state.ossHistory, status: "error", errorMessage: action.payload.message } };
     case "TOGGLE_HISTORY_DRAWER":
-      return { ...state, historyDrawerOpen: !state.historyDrawerOpen };
+      return { ...state, historyDrawerOpen: !state.historyDrawerOpen, historyDrawerProjectFilter: null };
     case "CLOSE_HISTORY_DRAWER":
-      return { ...state, historyDrawerOpen: false };
+      return { ...state, historyDrawerOpen: false, historyDrawerProjectFilter: null };
+    case "OPEN_HISTORY_DRAWER_FOR_PROJECT":
+      return { ...state, historyDrawerOpen: true, historyDrawerProjectFilter: action.payload };
     case "OSS_HISTORY_ENTRY_DELETED":
       return {
         ...state,
@@ -476,6 +479,7 @@ function appReducer(state, action) {
       const { entry, signedPlayUrl } = action.payload;
       return {
         ...state,
+        currentPage: "analysis",
         upload: {
           phase: "done", file: null,
           objectKey: entry.videoObjectKey,
@@ -485,6 +489,7 @@ function appReducer(state, action) {
         history: [entry],
         activeHistoryIdx: 0,
         historyDrawerOpen: false,
+        historyDrawerProjectFilter: null,
         analysis: { ...initialState.analysis },
         selectedProjectId: entry.projectId || null,
       };
@@ -1051,11 +1056,16 @@ function QueuePanel({ items, activeObjectKey, onClear, onSwitch }) {
 }
 
 // --- History Drawer ---
-function HistoryDrawer({ open, ossHistory, projectsList, onClose, onRestore, onDelete }) {
+function HistoryDrawer({ open, ossHistory, projectsList, filterProjectId, onClose, onRestore, onDelete }) {
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
+  const filterProject = filterProjectId ? (projectsList || []).find(p => p.id === filterProjectId) : null;
+  const filteredEntries = filterProjectId
+    ? (ossHistory.entries || []).filter(e => e.projectId === filterProjectId)
+    : (ossHistory.entries || []);
+
   const grouped = {};
-  (ossHistory.entries || []).forEach(entry => {
+  filteredEntries.forEach(entry => {
     const key = new Date(entry.timestamp).toLocaleDateString("zh-CN");
     if (!grouped[key]) grouped[key] = [];
     grouped[key].push(entry);
@@ -1075,7 +1085,9 @@ function HistoryDrawer({ open, ossHistory, projectsList, onClose, onRestore, onD
         ${open ? "translate-x-0" : "translate-x-full"}`}>
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 bg-gray-50">
-          <h2 className="font-semibold text-gray-800">📋 历史分析记录</h2>
+          <h2 className="font-semibold text-gray-800 truncate">
+            {filterProject ? `📁 ${filterProject.name} · 分析记录` : "📋 历史分析记录"}
+          </h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
         </div>
 
@@ -1093,8 +1105,10 @@ function HistoryDrawer({ open, ossHistory, projectsList, onClose, onRestore, onD
           {ossHistory.status === "error" && (
             <div className="text-red-500 text-sm p-3 bg-red-50 rounded">{ossHistory.errorMessage}</div>
           )}
-          {(ossHistory.status === "loaded" || ossHistory.status === "idle") && ossHistory.entries.length === 0 && (
-            <div className="text-gray-400 text-sm text-center mt-12">暂无历史记录</div>
+          {(ossHistory.status === "loaded" || ossHistory.status === "idle") && filteredEntries.length === 0 && (
+            <div className="text-gray-400 text-sm text-center mt-12">
+              {filterProjectId ? "该项目暂无分析记录" : "暂无历史记录"}
+            </div>
           )}
           {Object.entries(grouped).map(([date, entries]) => (
             <div key={date} className="mb-4">
@@ -1547,7 +1561,7 @@ function ProjectFormModal({ initial, onSave, onCancel }) {
 }
 
 // --- Project Management Page ---
-function ProjectManagementPage({ projects, ossHistory, config, onBack, onProjectAdded, onProjectUpdated, onProjectDeleted }) {
+function ProjectManagementPage({ projects, ossHistory, config, onBack, onProjectAdded, onProjectUpdated, onProjectDeleted, onViewHistory }) {
   const [modalState, setModalState] = useState(null); // null | { mode: 'create' } | { mode: 'edit', project }
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
@@ -1660,7 +1674,12 @@ function ProjectManagementPage({ projects, ossHistory, config, onBack, onProject
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-gray-400">
-                    📊 {entryCount} 条分析记录
+                    <button
+                      onClick={() => entryCount > 0 && onViewHistory(project.id)}
+                      className={`text-xs ${entryCount > 0 ? "text-blue-500 hover:text-blue-700 hover:underline cursor-pointer" : "text-gray-400 cursor-default"}`}
+                    >
+                      📊 {entryCount} 条分析记录
+                    </button>
                   </span>
                   <div className="flex gap-2">
                     <button
@@ -1958,6 +1977,7 @@ export default function App() {
           onProjectAdded={(project) => dispatch({ type: "PROJECT_ADDED", payload: project })}
           onProjectUpdated={(project) => dispatch({ type: "PROJECT_UPDATED", payload: project })}
           onProjectDeleted={(projectId) => dispatch({ type: "PROJECT_DELETED", payload: projectId })}
+          onViewHistory={(projectId) => dispatch({ type: "OPEN_HISTORY_DRAWER_FOR_PROJECT", payload: projectId })}
         />
       ) : (
         /* Main Analysis Content */
@@ -2073,6 +2093,7 @@ export default function App() {
         open={state.historyDrawerOpen}
         ossHistory={state.ossHistory}
         projectsList={state.projects.list}
+        filterProjectId={state.historyDrawerProjectFilter}
         onClose={() => dispatch({ type: "CLOSE_HISTORY_DRAWER" })}
         onRestore={handleRestoreFromHistory}
         onDelete={handleDeleteHistoryEntry}
