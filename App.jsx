@@ -418,7 +418,7 @@ function appReducer(state, action) {
         ...state,
         queue: {
           items: state.queue.items.map(i =>
-            i.id === id ? { ...i, status: "done", progress: 100 } : i
+            i.id === id ? { ...i, status: "done", progress: 100, signedPlayUrl: qSignedUrl } : i
           ),
           activeId: null,
         },
@@ -448,6 +448,23 @@ function appReducer(state, action) {
       };
     case "QUEUE_CLEAR":
       return { ...state, queue: { items: [], activeId: null } };
+
+    case "SWITCH_TO_QUEUE_ITEM": {
+      const { item } = action.payload;
+      return {
+        ...state,
+        upload: {
+          phase: "done",
+          file: item.file || null,
+          objectKey: item.objectKey,
+          signedPlayUrl: item.signedPlayUrl,
+          progress: 100,
+          errorCode: null,
+          errorMessage: "",
+        },
+        analysis: { ...initialState.analysis },
+      };
+    }
 
     default:
       return state;
@@ -837,7 +854,7 @@ function UploadZone({ onFilesSelected, uploadError, onClearError }) {
 }
 
 // --- Queue Panel ---
-function QueuePanel({ items, onClear }) {
+function QueuePanel({ items, activeObjectKey, onClear, onSwitch }) {
   if (items.length === 0) return null;
   const statusConfig = {
     waiting:   { text: "等待中", cls: "bg-gray-100 text-gray-500" },
@@ -854,11 +871,25 @@ function QueuePanel({ items, onClear }) {
       <div className="flex flex-col gap-2">
         {items.map(item => {
           const sc = statusConfig[item.status];
+          const isActive = item.objectKey === activeObjectKey;
           return (
-            <div key={item.id} className="flex flex-col gap-1">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-gray-600 truncate max-w-[200px]">{item.file?.name}</span>
-                <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${sc.cls}`}>{sc.text}</span>
+            <div key={item.id} className={`flex flex-col gap-1 rounded-lg px-2 py-1 ${isActive ? "bg-blue-50 border border-blue-200" : ""}`}>
+              <div className="flex items-center justify-between text-xs gap-2">
+                <span className="text-gray-600 truncate max-w-[160px]">{item.file?.name}</span>
+                <div className="flex items-center gap-1 shrink-0">
+                  {item.status === "done" && !isActive && (
+                    <button
+                      onClick={() => onSwitch(item)}
+                      className="px-2 py-0.5 text-xs bg-blue-50 text-blue-600 border border-blue-200 rounded hover:bg-blue-100"
+                    >
+                      切换
+                    </button>
+                  )}
+                  {isActive && item.status === "done" && (
+                    <span className="px-2 py-0.5 text-xs bg-blue-600 text-white rounded">当前</span>
+                  )}
+                  <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${sc.cls}`}>{sc.text}</span>
+                </div>
               </div>
               {item.status === "uploading" && (
                 <div className="w-full bg-gray-200 rounded-full h-1">
@@ -1490,7 +1521,9 @@ export default function App() {
             {queue.items.length > 0 && (
               <QueuePanel
                 items={queue.items}
+                activeObjectKey={upload.objectKey}
                 onClear={() => dispatch({ type: "QUEUE_CLEAR" })}
+                onSwitch={(item) => dispatch({ type: "SWITCH_TO_QUEUE_ITEM", payload: { item } })}
               />
             )}
             {upload.phase === "done" && (
