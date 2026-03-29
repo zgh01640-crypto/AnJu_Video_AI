@@ -69,7 +69,7 @@ async function saveAnalysisToOSS(config, entry) {
     timestamp: entry.timestamp instanceof Date ? entry.timestamp.toISOString() : entry.timestamp,
   });
   const blob = new Blob([json], { type: "application/json" });
-  const objectKey = `analysis/${encodeURIComponent(entry.videoObjectKey)}.json`;
+  const objectKey = `analysis/${entry.id}.json`;
   const putUrl = await generateOSSPresignedUrl(config, objectKey, "PUT", 3600, "application/json");
   const res = await fetch(putUrl, {
     method: "PUT",
@@ -131,7 +131,7 @@ async function loadOSSHistory(config) {
 }
 
 async function deleteOSSHistoryEntry(config, entry) {
-  const objectKey = `analysis/${encodeURIComponent(entry.videoObjectKey)}.json`;
+  const objectKey = `analysis/${entry.id}.json`;
   await updateOSSIndex(config, objectKey, "remove");
 }
 
