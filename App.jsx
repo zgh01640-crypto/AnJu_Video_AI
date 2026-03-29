@@ -980,13 +980,24 @@ export default function App() {
         <h1 className="text-base font-semibold tracking-wide">
           🏗 安居集团 · 工程视频分析系统
         </h1>
-        <button
-          onClick={() => dispatch({ type: "TOGGLE_CONFIG_PANEL" })}
-          title="系统配置"
-          className="text-blue-200 hover:text-white transition-colors text-lg"
-        >
-          ⚙️
-        </button>
+        <div className="flex items-center gap-4">
+          {isConfigured && (
+            <div className="hidden sm:flex items-center gap-3 text-xs text-blue-200">
+              <span title="AI 分析模型">🤖 qwen-vl-plus</span>
+              <span className="text-blue-500">|</span>
+              <span title="OSS 存储"
+                className="max-w-[180px] truncate"
+              >🗄 {state.config.ossBucket} · {state.config.ossRegion}</span>
+            </div>
+          )}
+          <button
+            onClick={() => dispatch({ type: "TOGGLE_CONFIG_PANEL" })}
+            title="系统配置"
+            className="text-blue-200 hover:text-white transition-colors text-lg"
+          >
+            ⚙️
+          </button>
+        </div>
       </header>
 
       {/* Config Panel */}
