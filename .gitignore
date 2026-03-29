@@ -11,5 +11,6 @@ Thumbs.db
 .env
 .env.local
 
-# 依赖（如未来添加 Node 项目）
+# 依赖与构建产物
 node_modules/
+dist/
