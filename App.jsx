@@ -1,5 +1,5 @@
 // ===== SECTION 1: IMPORTS =====
-import { useState, useReducer, useRef, useEffect, useCallback } from "react";
+import { useState, useReducer, useRef, useCallback } from "react";
 
 // ===== SECTION 2: CONSTANTS =====
 const DEFAULT_PROMPT = "请分析工程视频，正在进行哪些专业施工，形象进度如何";
@@ -258,7 +258,6 @@ function useOSSUpload() {
     await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("PUT", uploadUrl);
-      xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
 
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
