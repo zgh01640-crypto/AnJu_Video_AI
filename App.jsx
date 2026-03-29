@@ -1311,48 +1311,6 @@ export default function App() {
       });
     }
   }
-      });
-      return;
-    }
-    // Validate size
-    if (file.size > MAX_FILE_SIZE) {
-      dispatch({
-        type: "UPLOAD_ERROR",
-        payload: {
-          errorCode: "E002",
-          errorMessage: "文件大小超出限制（最大 200MB），请压缩后重新上传",
-        },
-      });
-      return;
-    }
-
-    const objectKey = buildOSSObjectKey(file.name);
-    dispatch({ type: "FILE_SELECTED", payload: { file, objectKey } });
-
-    // Start upload
-    ossUpload(state.config, file, objectKey, dispatch)
-      .then(async () => {
-        const signedPlayUrl = await generateOSSPresignedUrl(
-          state.config,
-          objectKey,
-          "GET",
-          7200
-        );
-        dispatch({ type: "UPLOAD_DONE", payload: { signedPlayUrl } });
-      })
-      .catch((err) => {
-        const isCors = err.message === "CORS_ERROR";
-        dispatch({
-          type: "UPLOAD_ERROR",
-          payload: {
-            errorCode: "E003",
-            errorMessage: isCors
-              ? "上传失败：OSS 跨域（CORS）未配置，请联系管理员参考 SETUP.md 配置"
-              : `上传失败：${err.message}`,
-          },
-        });
-      });
-  }
 
   async function handleAnalyze() {
     if (!canAnalyze) return;
