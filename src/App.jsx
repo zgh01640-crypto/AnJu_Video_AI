@@ -44,11 +44,12 @@ async function generateOSSPresignedUrl(config, objectKey, method = "PUT", expire
   return `${endpoint}/${objectKey}?OSSAccessKeyId=${ossAccessKeyId}&Expires=${expiresTimestamp}&Signature=${sig}`;
 }
 
-function buildOSSObjectKey(filename) {
+function buildOSSObjectKey(filename, projectId = null) {
   const date = new Date().toISOString().slice(0, 10);
   const ts = Date.now();
   const safeName = filename.replace(/[^a-zA-Z0-9._\u4e00-\u9fa5-]/g, "_");
-  return `videos/${date}/${ts}_${safeName}`;
+  const prefix = projectId || "unassigned";
+  return `videos/${prefix}/${date}/${ts}_${safeName}`;
 }
 
 function formatElapsed(ms) {
@@ -69,7 +70,8 @@ async function saveAnalysisToOSS(config, entry) {
     timestamp: entry.timestamp instanceof Date ? entry.timestamp.toISOString() : entry.timestamp,
   });
   const blob = new Blob([json], { type: "application/json" });
-  const objectKey = `analysis/${entry.id}.json`;
+  const prefix = entry.projectId || "unassigned";
+  const objectKey = `analysis/${prefix}/${entry.id}.json`;
   const putUrl = await generateOSSPresignedUrl(config, objectKey, "PUT", 3600, "application/json");
   const res = await fetch(putUrl, {
     method: "PUT",
@@ -80,8 +82,9 @@ async function saveAnalysisToOSS(config, entry) {
   return objectKey;
 }
 
-async function updateOSSIndex(config, analysisObjectKey, action = "add") {
-  const indexKey = "analysis/index.json";
+async function updateOSSIndex(config, analysisObjectKey, action = "add", projectId = null) {
+  const prefix = projectId || "unassigned";
+  const indexKey = `analysis/${prefix}/index.json`;
   let currentKeys = [];
   try {
     const getUrl = await generateOSSPresignedUrl(config, indexKey, "GET", 300);
@@ -105,8 +108,10 @@ async function updateOSSIndex(config, analysisObjectKey, action = "add") {
   if (!res.ok) throw new Error(`OSS index PUT failed: ${res.status}`);
 }
 
-async function loadOSSHistory(config) {
-  const indexKey = "analysis/index.json";
+// 加载指定项目（或 unassigned）的历史，projectId=null 表示 unassigned
+async function loadOSSHistory(config, projectId = null) {
+  const prefix = projectId || "unassigned";
+  const indexKey = `analysis/${prefix}/index.json`;
   const getUrl = await generateOSSPresignedUrl(config, indexKey, "GET", 300);
   const indexRes = await fetch(getUrl);
   if (!indexRes.ok) {
@@ -121,18 +126,83 @@ async function loadOSSHistory(config) {
       const res = await fetch(entryUrl);
       if (!res.ok) throw new Error(`entry ${objectKey} HTTP ${res.status}`);
       const data = await res.json();
-      return { ...data, timestamp: new Date(data.timestamp) };
+      return { ...data, timestamp: new Date(data.timestamp), projectId: data.projectId || projectId };
     })
   );
   return results
     .filter(r => r.status === "fulfilled")
-    .map(r => r.value)
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    .map(r => r.value);
+}
+
+// 加载所有项目 + unassigned + 兼容 v1.1 旧 analysis/index.json
+async function loadAllOSSHistory(config, projectsList = []) {
+  const projectIds = [null, ...projectsList.map(p => p.id)];
+
+  // 并行加载各项目历史 + 兼容 v1.1 legacy（analysis/index.json 顶层）
+  const [projectResults, legacyResult] = await Promise.all([
+    Promise.allSettled(projectIds.map(pid => loadOSSHistory(config, pid))),
+    // v1.1 兼容：尝试读取顶层 analysis/index.json
+    (async () => {
+      try {
+        const getUrl = await generateOSSPresignedUrl(config, "analysis/index.json", "GET", 300);
+        const res = await fetch(getUrl);
+        if (!res.ok) return [];
+        const keys = await res.json();
+        const entryResults = await Promise.allSettled(
+          keys.map(async (objectKey) => {
+            const entryUrl = await generateOSSPresignedUrl(config, objectKey, "GET", 300);
+            const r = await fetch(entryUrl);
+            if (!r.ok) return null;
+            const data = await r.json();
+            return { ...data, timestamp: new Date(data.timestamp), projectId: data.projectId || null };
+          })
+        );
+        return entryResults.filter(r => r.status === "fulfilled" && r.value).map(r => r.value);
+      } catch { return []; }
+    })(),
+  ]);
+
+  const all = [
+    ...projectResults.filter(r => r.status === "fulfilled").flatMap(r => r.value),
+    ...legacyResult,
+  ];
+
+  // 去重（同一 id 可能在 legacy 和项目目录都有）
+  const seen = new Set();
+  const unique = all.filter(e => {
+    if (seen.has(e.id)) return false;
+    seen.add(e.id);
+    return true;
+  });
+
+  return unique.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 }
 
 async function deleteOSSHistoryEntry(config, entry) {
-  const objectKey = `analysis/${entry.id}.json`;
-  await updateOSSIndex(config, objectKey, "remove");
+  const objectKey = `analysis/${entry.projectId || "unassigned"}/${entry.id}.json`;
+  await updateOSSIndex(config, objectKey, "remove", entry.projectId || null);
+}
+
+// ===== PROJECT PERSISTENCE =====
+
+async function saveProjectsToOSS(config, projects) {
+  const blob = new Blob([JSON.stringify(projects)], { type: "application/json" });
+  const putUrl = await generateOSSPresignedUrl(config, "projects/projects.json", "PUT", 3600, "application/json");
+  const res = await fetch(putUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: blob,
+  });
+  if (!res.ok) throw new Error(`OSS projects PUT failed: ${res.status}`);
+}
+
+async function loadProjectsFromOSS(config) {
+  try {
+    const getUrl = await generateOSSPresignedUrl(config, "projects/projects.json", "GET", 300);
+    const res = await fetch(getUrl);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch { return []; }
 }
 
 // 从 File 对象提取视频元数据（时长、分辨率）
@@ -213,6 +283,15 @@ const initialState = {
     items: [],   // QueueItem[]
     activeId: null,
   },
+
+  // v2.0: 工程项目维度管理
+  projects: {
+    status: "idle", // 'idle'|'loading'|'loaded'|'error'
+    list: [],
+    errorMessage: "",
+  },
+  currentPage: "analysis",   // 'analysis' | 'projects'
+  selectedProjectId: null,   // 上传时选择的项目 ID
 };
 
 function appReducer(state, action) {
@@ -322,6 +401,7 @@ function appReducer(state, action) {
         resultText: state.analysis.streamBuffer,
         elapsedMs: action.payload.elapsedMs,
         videoObjectKey: state.upload.objectKey,
+        projectId: state.selectedProjectId,
       };
       const newHistory = [entry, ...state.history].slice(0, 3);
       return {
@@ -406,6 +486,7 @@ function appReducer(state, action) {
         activeHistoryIdx: 0,
         historyDrawerOpen: false,
         analysis: { ...initialState.analysis },
+        selectedProjectId: entry.projectId || null,
       };
     }
 
@@ -488,6 +569,36 @@ function appReducer(state, action) {
       };
     }
 
+    // ===== v2.0: PROJECT ACTIONS =====
+    case "PROJECTS_LOADING":
+      return { ...state, projects: { ...state.projects, status: "loading" } };
+    case "PROJECTS_LOADED":
+      return { ...state, projects: { status: "loaded", list: action.payload.list, errorMessage: "" } };
+    case "PROJECTS_ERROR":
+      return { ...state, projects: { ...state.projects, status: "error", errorMessage: action.payload.message } };
+    case "NAVIGATE_TO_PROJECTS":
+      return { ...state, currentPage: "projects" };
+    case "NAVIGATE_TO_ANALYSIS":
+      return { ...state, currentPage: "analysis" };
+    case "SET_SELECTED_PROJECT":
+      return { ...state, selectedProjectId: action.payload };
+    case "PROJECT_ADDED":
+      return { ...state, projects: { ...state.projects, list: [...state.projects.list, action.payload] } };
+    case "PROJECT_UPDATED":
+      return {
+        ...state,
+        projects: {
+          ...state.projects,
+          list: state.projects.list.map(p => p.id === action.payload.id ? action.payload : p),
+        },
+      };
+    case "PROJECT_DELETED":
+      return {
+        ...state,
+        projects: { ...state.projects, list: state.projects.list.filter(p => p.id !== action.payload) },
+        selectedProjectId: state.selectedProjectId === action.payload ? null : state.selectedProjectId,
+      };
+
     default:
       return state;
   }
@@ -499,16 +610,16 @@ function useOSSPersistence() {
   const persistEntry = useCallback(async (config, entry, dispatch) => {
     try {
       const objectKey = await saveAnalysisToOSS(config, entry);
-      await updateOSSIndex(config, objectKey, "add");
+      await updateOSSIndex(config, objectKey, "add", entry.projectId || null);
     } catch (err) {
       dispatch({ type: "OSS_SAVE_ERROR", payload: { message: err.message } });
     }
   }, []);
 
-  const loadHistory = useCallback(async (config, dispatch) => {
+  const loadHistory = useCallback(async (config, projectsList, dispatch) => {
     dispatch({ type: "OSS_HISTORY_LOADING" });
     try {
-      const entries = await loadOSSHistory(config);
+      const entries = await loadAllOSSHistory(config, projectsList);
       dispatch({ type: "OSS_HISTORY_LOADED", payload: { entries } });
     } catch (err) {
       dispatch({ type: "OSS_HISTORY_ERROR", payload: { message: err.message } });
@@ -940,7 +1051,7 @@ function QueuePanel({ items, activeObjectKey, onClear, onSwitch }) {
 }
 
 // --- History Drawer ---
-function HistoryDrawer({ open, ossHistory, onClose, onRestore, onDelete }) {
+function HistoryDrawer({ open, ossHistory, projectsList, onClose, onRestore, onDelete }) {
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
   const grouped = {};
@@ -992,8 +1103,16 @@ function HistoryDrawer({ open, ossHistory, onClose, onRestore, onDelete }) {
                 <div key={entry.id} className="bg-gray-50 rounded-lg p-3 mb-2 border border-gray-100">
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs text-gray-400 mb-1">
-                        {new Date(entry.timestamp).toLocaleTimeString("zh-CN")} · {formatElapsed(entry.elapsedMs)}
+                      <p className="text-xs text-gray-400 mb-1 flex items-center gap-1.5 flex-wrap">
+                        <span>{new Date(entry.timestamp).toLocaleTimeString("zh-CN")} · {formatElapsed(entry.elapsedMs)}</span>
+                        {(() => {
+                          const proj = (projectsList || []).find(p => p.id === entry.projectId);
+                          return proj
+                            ? <span className="px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded text-xs">📁 {proj.name}</span>
+                            : entry.projectId === null || entry.projectId === undefined
+                              ? <span className="px-1.5 py-0.5 bg-gray-100 text-gray-400 rounded text-xs">未分类</span>
+                              : null;
+                        })()}
                       </p>
                       <p className="text-sm text-gray-700 line-clamp-2 leading-relaxed">
                         {(entry.resultText || "").slice(0, 80)}…
@@ -1036,6 +1155,42 @@ function HistoryDrawer({ open, ossHistory, onClose, onRestore, onDelete }) {
         </div>
       </div>
     </>
+  );
+}
+
+// --- Project Selector ---
+function ProjectSelector({ projectsList, selectedProjectId, onSelect, onCreateNew }) {
+  const selectedProject = projectsList.find(p => p.id === selectedProjectId);
+  const PHASE_COLORS = { 基础: "bg-yellow-100 text-yellow-700", 主体: "bg-blue-100 text-blue-700", 装修: "bg-purple-100 text-purple-700", 竣工: "bg-green-100 text-green-700" };
+
+  return (
+    <div className="flex items-center gap-2 bg-white border border-gray-200 rounded-xl px-3 py-2">
+      <span className="text-xs text-gray-500 shrink-0">🏗 所属项目：</span>
+      <select
+        value={selectedProjectId || ""}
+        onChange={e => onSelect(e.target.value || null)}
+        className="flex-1 text-sm border-0 bg-transparent focus:outline-none text-gray-700 cursor-pointer min-w-0"
+      >
+        <option value="">未分类</option>
+        {projectsList.map(p => (
+          <option key={p.id} value={p.id}>
+            {p.name}{p.code ? ` (${p.code})` : ""}
+          </option>
+        ))}
+      </select>
+      {selectedProject?.phase && (
+        <span className={`text-xs px-1.5 py-0.5 rounded-full shrink-0 ${PHASE_COLORS[selectedProject.phase] || "bg-gray-100 text-gray-500"}`}>
+          {selectedProject.phase}
+        </span>
+      )}
+      <button
+        onClick={onCreateNew}
+        className="text-xs text-blue-600 hover:text-blue-800 shrink-0 font-medium"
+        title="新建项目"
+      >
+        + 新建
+      </button>
+    </div>
   );
 }
 
@@ -1311,6 +1466,248 @@ function ResultCard({ result, streamBuffer, isStreaming }) {
   );
 }
 
+// --- Project Form Modal ---
+const PHASE_OPTIONS = ["", "基础", "主体", "装修", "竣工"];
+const PHASE_LABELS = { 基础: "基础工程", 主体: "主体结构", 装修: "装修施工", 竣工: "竣工验收" };
+const PHASE_COLORS = { 基础: "bg-yellow-100 text-yellow-700", 主体: "bg-blue-100 text-blue-700", 装修: "bg-purple-100 text-purple-700", 竣工: "bg-green-100 text-green-700" };
+
+function ProjectFormModal({ initial, onSave, onCancel }) {
+  const [form, setForm] = useState({
+    name: "", code: "", address: "", manager: "",
+    startDate: "", expectedEndDate: "", phase: "",
+    ...initial,
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  function set(key, value) { setForm(p => ({ ...p, [key]: value })); }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (!form.name.trim()) { setError("项目名称不能为空"); return; }
+    setSaving(true);
+    try {
+      await onSave(form);
+    } catch (err) {
+      setError(err.message);
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-40 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
+        <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">{initial?.id ? "编辑项目" : "新建工程项目"}</h3>
+          <button onClick={onCancel} className="text-gray-400 hover:text-gray-700 text-xl">×</button>
+        </div>
+        <form onSubmit={handleSubmit} className="p-6 grid grid-cols-2 gap-4">
+          <div className="col-span-2">
+            <label className="block text-xs font-medium text-gray-600 mb-1">项目名称 <span className="text-red-500">*</span></label>
+            <input value={form.name} onChange={e => set("name", e.target.value)} placeholder="如：安居花园 A 栋" className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">项目编号</label>
+            <input value={form.code} onChange={e => set("code", e.target.value)} placeholder="如：AJ-2026-001" className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">项目负责人</label>
+            <input value={form.manager} onChange={e => set("manager", e.target.value)} placeholder="姓名" className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          </div>
+          <div className="col-span-2">
+            <label className="block text-xs font-medium text-gray-600 mb-1">施工地址</label>
+            <input value={form.address} onChange={e => set("address", e.target.value)} placeholder="如：广东省深圳市南山区…" className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">开工日期</label>
+            <input type="date" value={form.startDate} onChange={e => set("startDate", e.target.value)} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">预计竣工日期</label>
+            <input type="date" value={form.expectedEndDate} onChange={e => set("expectedEndDate", e.target.value)} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          </div>
+          <div className="col-span-2">
+            <label className="block text-xs font-medium text-gray-600 mb-1">当前阶段</label>
+            <select value={form.phase} onChange={e => set("phase", e.target.value)} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+              <option value="">— 未设置 —</option>
+              {PHASE_OPTIONS.filter(Boolean).map(p => <option key={p} value={p}>{PHASE_LABELS[p]}</option>)}
+            </select>
+          </div>
+          {error && <div className="col-span-2 text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</div>}
+          <div className="col-span-2 flex justify-end gap-3 pt-2">
+            <button type="button" onClick={onCancel} className="px-5 py-2 rounded-lg text-sm text-gray-600 bg-gray-100 hover:bg-gray-200">取消</button>
+            <button type="submit" disabled={saving} className="px-5 py-2 rounded-lg text-sm font-medium text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-40">
+              {saving ? "保存中…" : "保存"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// --- Project Management Page ---
+function ProjectManagementPage({ projects, ossHistory, config, onBack, onProjectAdded, onProjectUpdated, onProjectDeleted }) {
+  const [modalState, setModalState] = useState(null); // null | { mode: 'create' } | { mode: 'edit', project }
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  function getEntryCount(projectId) {
+    return (ossHistory.entries || []).filter(e => e.projectId === projectId).length;
+  }
+
+  async function handleSave(form) {
+    if (modalState?.mode === "create") {
+      const project = { ...form, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
+      const updatedList = [...projects.list, project];
+      await saveProjectsToOSS(config, updatedList);
+      onProjectAdded(project);
+    } else {
+      const project = { ...modalState.project, ...form };
+      const updatedList = projects.list.map(p => p.id === project.id ? project : p);
+      await saveProjectsToOSS(config, updatedList);
+      onProjectUpdated(project);
+    }
+    setModalState(null);
+  }
+
+  async function handleDelete(projectId) {
+    const updatedList = projects.list.filter(p => p.id !== projectId);
+    await saveProjectsToOSS(config, updatedList);
+    onProjectDeleted(projectId);
+    setConfirmDeleteId(null);
+  }
+
+  return (
+    <main className="flex-1 p-4">
+      <div className="max-w-4xl mx-auto">
+        {/* Page header */}
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-3">
+            <button onClick={onBack} className="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
+              ← 返回
+            </button>
+            <h2 className="text-lg font-semibold text-gray-800">📁 工程项目管理</h2>
+          </div>
+          <button
+            onClick={() => setModalState({ mode: "create" })}
+            className="px-4 py-2 bg-blue-700 text-white rounded-xl text-sm font-medium hover:bg-blue-800 transition-colors"
+          >
+            + 新建项目
+          </button>
+        </div>
+
+        {/* Loading / Error states */}
+        {projects.status === "loading" && (
+          <div className="text-center text-gray-400 py-16 text-sm">加载中…</div>
+        )}
+        {projects.status === "error" && (
+          <div className="text-center text-red-500 py-16 text-sm">{projects.errorMessage}</div>
+        )}
+
+        {/* Empty state */}
+        {(projects.status === "loaded" || projects.status === "idle") && projects.list.length === 0 && (
+          <div className="text-center py-20">
+            <div className="text-6xl mb-4">🏗</div>
+            <p className="text-gray-500 mb-2">暂无工程项目</p>
+            <p className="text-gray-400 text-sm mb-6">创建项目后，上传视频时可将分析结果归档到对应项目</p>
+            <button
+              onClick={() => setModalState({ mode: "create" })}
+              className="px-6 py-2.5 bg-blue-700 text-white rounded-xl text-sm font-medium hover:bg-blue-800"
+            >
+              + 新建第一个项目
+            </button>
+          </div>
+        )}
+
+        {/* Project cards */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {projects.list.map(project => {
+            const entryCount = getEntryCount(project.id);
+            return (
+              <div key={project.id} className="bg-white border border-gray-200 rounded-2xl p-5 shadow-sm hover:shadow-md transition-shadow">
+                <div className="flex items-start justify-between gap-3 mb-3">
+                  <div className="min-w-0">
+                    <h3 className="font-semibold text-gray-900 truncate">{project.name}</h3>
+                    {project.code && <p className="text-xs text-gray-400 mt-0.5">{project.code}</p>}
+                  </div>
+                  {project.phase && (
+                    <span className={`text-xs px-2 py-1 rounded-full shrink-0 font-medium ${PHASE_COLORS[project.phase] || "bg-gray-100 text-gray-500"}`}>
+                      {project.phase}
+                    </span>
+                  )}
+                </div>
+                <div className="space-y-1.5 text-sm text-gray-600 mb-4">
+                  {project.address && (
+                    <div className="flex items-start gap-1.5">
+                      <span className="text-gray-400 shrink-0">📍</span>
+                      <span className="truncate">{project.address}</span>
+                    </div>
+                  )}
+                  {project.manager && (
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-gray-400">👤</span>
+                      <span>{project.manager}</span>
+                    </div>
+                  )}
+                  {(project.startDate || project.expectedEndDate) && (
+                    <div className="flex items-center gap-1.5 text-xs text-gray-500">
+                      <span className="text-gray-400">📅</span>
+                      <span>
+                        {project.startDate || "—"} → {project.expectedEndDate || "—"}
+                      </span>
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-400">
+                    📊 {entryCount} 条分析记录
+                  </span>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setModalState({ mode: "edit", project })}
+                      className="text-xs px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-lg"
+                    >
+                      编辑
+                    </button>
+                    {confirmDeleteId === project.id ? (
+                      <div className="flex gap-1">
+                        <button
+                          onClick={() => handleDelete(project.id)}
+                          className="text-xs px-2.5 py-1.5 bg-red-500 hover:bg-red-600 text-white rounded-lg"
+                        >确认删除</button>
+                        <button
+                          onClick={() => setConfirmDeleteId(null)}
+                          className="text-xs px-2.5 py-1.5 bg-gray-200 text-gray-600 rounded-lg"
+                        >取消</button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmDeleteId(project.id)}
+                        className="text-xs px-3 py-1.5 bg-gray-100 hover:bg-red-50 hover:text-red-500 text-gray-500 rounded-lg"
+                      >
+                        删除
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Modal */}
+      {modalState && (
+        <ProjectFormModal
+          initial={modalState.mode === "edit" ? modalState.project : undefined}
+          onSave={handleSave}
+          onCancel={() => setModalState(null)}
+        />
+      )}
+    </main>
+  );
+}
+
 // ===== SECTION 7: MAIN APP COMPONENT =====
 
 export default function App() {
@@ -1327,9 +1724,19 @@ export default function App() {
     state.prompt.text.trim() !== "" &&
     state.analysis.status !== "streaming";
 
-  // 启动时从 OSS 加载历史记录
+  // 启动时从 OSS 加载项目列表和历史记录
   useEffect(() => {
-    if (isConfigured) loadHistory(state.config, dispatch);
+    if (!isConfigured) return;
+    dispatch({ type: "PROJECTS_LOADING" });
+    loadProjectsFromOSS(state.config)
+      .then(list => {
+        dispatch({ type: "PROJECTS_LOADED", payload: { list } });
+        return loadHistory(state.config, list, dispatch);
+      })
+      .catch(() => {
+        dispatch({ type: "PROJECTS_ERROR", payload: { message: "项目加载失败" } });
+        loadHistory(state.config, [], dispatch);
+      });
   }, []);
 
   // 队列处理器
@@ -1367,7 +1774,8 @@ export default function App() {
       validItems.push({
         id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
         file,
-        objectKey: buildOSSObjectKey(file.name),
+        objectKey: buildOSSObjectKey(file.name, state.selectedProjectId),
+        projectId: state.selectedProjectId,
         status: "waiting",
         progress: 0,
         errorMessage: "",
@@ -1430,6 +1838,7 @@ export default function App() {
         resultText: localBuffer,
         elapsedMs,
         videoObjectKey: state.upload.objectKey,
+        projectId: state.selectedProjectId,
       };
       // 立即更新本地历史列表，无需等待 OSS 写入
       dispatch({ type: "OSS_HISTORY_ENTRY_ADDED", payload: { entry } });
@@ -1484,7 +1893,7 @@ export default function App() {
       {/* Header */}
       <header className="bg-blue-800 text-white px-5 py-3 flex items-center justify-between shadow">
         <h1 className="text-base font-semibold tracking-wide">
-          🏗 安居集团 · 工程视频分析系统
+          🏗 深圳市安居集团 · 工程视频分析智能体（v1.1）
         </h1>
         <div className="flex items-center gap-4">
           {isConfigured && (
@@ -1493,6 +1902,15 @@ export default function App() {
               <span className="text-blue-500">|</span>
               <span title="OSS 存储" className="max-w-[180px] truncate">🗄 {state.config.ossRegion}</span>
             </div>
+          )}
+          {isConfigured && (
+            <button
+              onClick={() => dispatch({ type: "NAVIGATE_TO_PROJECTS" })}
+              title="工程项目管理"
+              className={`transition-colors text-lg ${state.currentPage === "projects" ? "text-white" : "text-blue-200 hover:text-white"}`}
+            >
+              📁
+            </button>
           )}
           {isConfigured && (
             <button
@@ -1530,108 +1948,131 @@ export default function App() {
         />
       )}
 
-      {/* Main Content */}
-      <main
-        className={`flex-1 p-4 transition-opacity ${!isConfigured && !state.configPanelOpen ? "opacity-40 pointer-events-none" : ""}`}
-      >
-        <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-4">
-          {/* Left: Video area */}
-          <div className="lg:col-span-2 flex flex-col gap-3">
-            {upload.phase === "done" ? (
-              <VideoPlayer
-                src={upload.signedPlayUrl}
-                filename={upload.file?.name}
-                fileSize={upload.file?.size}
-                onError={handleVideoError}
+      {/* Page Routing */}
+      {state.currentPage === "projects" ? (
+        <ProjectManagementPage
+          projects={state.projects}
+          ossHistory={state.ossHistory}
+          config={state.config}
+          onBack={() => dispatch({ type: "NAVIGATE_TO_ANALYSIS" })}
+          onProjectAdded={(project) => dispatch({ type: "PROJECT_ADDED", payload: project })}
+          onProjectUpdated={(project) => dispatch({ type: "PROJECT_UPDATED", payload: project })}
+          onProjectDeleted={(projectId) => dispatch({ type: "PROJECT_DELETED", payload: projectId })}
+        />
+      ) : (
+        /* Main Analysis Content */
+        <main
+          className={`flex-1 p-4 transition-opacity ${!isConfigured && !state.configPanelOpen ? "opacity-40 pointer-events-none" : ""}`}
+        >
+          <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-4">
+            {/* Left: Video area */}
+            <div className="lg:col-span-2 flex flex-col gap-3">
+              {upload.phase === "done" ? (
+                <VideoPlayer
+                  src={upload.signedPlayUrl}
+                  filename={upload.file?.name}
+                  fileSize={upload.file?.size}
+                  onError={handleVideoError}
+                />
+              ) : (
+                <UploadZone
+                  onFilesSelected={handleFilesSelected}
+                  uploadError={uploadErrorMsg}
+                  onClearError={() => dispatch({ type: "RESET_UPLOAD" })}
+                />
+              )}
+              {/* Project selector — shown below video/upload zone, hidden only during upload */}
+              {upload.phase !== "uploading" && (
+                <ProjectSelector
+                  projectsList={state.projects.list}
+                  selectedProjectId={state.selectedProjectId}
+                  onSelect={(id) => dispatch({ type: "SET_SELECTED_PROJECT", payload: id })}
+                  onCreateNew={() => dispatch({ type: "NAVIGATE_TO_PROJECTS" })}
+                />
+              )}
+              {upload.phase === "uploading" && (
+                <UploadProgress
+                  progress={upload.progress}
+                  filename={upload.file?.name}
+                  fileSize={upload.file?.size}
+                />
+              )}
+              {queue.items.length > 0 && (
+                <QueuePanel
+                  items={queue.items}
+                  activeObjectKey={upload.objectKey}
+                  onClear={() => dispatch({ type: "QUEUE_CLEAR" })}
+                  onSwitch={(item) => dispatch({ type: "SWITCH_TO_QUEUE_ITEM", payload: { item } })}
+                />
+              )}
+              {upload.phase === "done" && (
+                <button
+                  onClick={() => dispatch({ type: "RESET_UPLOAD" })}
+                  className="text-sm text-gray-400 hover:text-gray-600 underline self-start"
+                >
+                  重新上传视频
+                </button>
+              )}
+            </div>
+
+            {/* Right: Prompt + Analysis button */}
+            <div className="flex flex-col gap-3">
+              <PromptEditor
+                prompt={prompt}
+                onPromptChange={handlePromptChange}
+                onQuickTag={handleQuickTag}
+                onReset={() => dispatch({ type: "RESET_PROMPT" })}
               />
-            ) : (
-              <UploadZone
-                onFilesSelected={handleFilesSelected}
-                uploadError={uploadErrorMsg}
-                onClearError={() => dispatch({ type: "RESET_UPLOAD" })}
+
+              <AnalysisButton
+                status={analysis.status}
+                onClick={handleAnalyze}
+                disabled={!canAnalyze}
               />
-            )}
-            {upload.phase === "uploading" && (
-              <UploadProgress
-                progress={upload.progress}
-                filename={upload.file?.name}
-                fileSize={upload.file?.size}
-              />
-            )}
-            {queue.items.length > 0 && (
-              <QueuePanel
-                items={queue.items}
-                activeObjectKey={upload.objectKey}
-                onClear={() => dispatch({ type: "QUEUE_CLEAR" })}
-                onSwitch={(item) => dispatch({ type: "SWITCH_TO_QUEUE_ITEM", payload: { item } })}
-              />
-            )}
-            {upload.phase === "done" && (
-              <button
-                onClick={() => dispatch({ type: "RESET_UPLOAD" })}
-                className="text-sm text-gray-400 hover:text-gray-600 underline self-start"
-              >
-                重新上传视频
-              </button>
-            )}
+
+              {/* Analysis error / timeout inline feedback */}
+              {(analysis.status === "error" || analysis.status === "timeout") && (
+                <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm text-red-700">
+                  ⚠️ {analysis.errorMessage}
+                </div>
+              )}
+            </div>
           </div>
 
-          {/* Right: Prompt + Analysis button */}
-          <div className="flex flex-col gap-3">
-            <PromptEditor
-              prompt={prompt}
-              onPromptChange={handlePromptChange}
-              onQuickTag={handleQuickTag}
-              onReset={() => dispatch({ type: "RESET_PROMPT" })}
-            />
-
-            <AnalysisButton
-              status={analysis.status}
-              onClick={handleAnalyze}
-              disabled={!canAnalyze}
-            />
-
-            {/* Analysis error / timeout inline feedback */}
-            {(analysis.status === "error" || analysis.status === "timeout") && (
-              <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm text-red-700">
-                ⚠️ {analysis.errorMessage}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Results section */}
-        {(isStreaming || history.length > 0) && (
-          <div className="max-w-6xl mx-auto mt-5">
-            <h2 className="font-semibold text-gray-700 mb-3 flex items-center gap-2">
-              📊 分析结果
-            </h2>
-            <ResultTabs
-              results={history}
-              activeIdx={activeHistoryIdx}
-              onSelect={(i) => dispatch({ type: "SELECT_HISTORY_TAB", payload: i })}
-            />
-            {isStreaming ? (
-              <ResultCard
-                result={null}
-                streamBuffer={analysis.streamBuffer}
-                isStreaming
+          {/* Results section */}
+          {(isStreaming || history.length > 0) && (
+            <div className="max-w-6xl mx-auto mt-5">
+              <h2 className="font-semibold text-gray-700 mb-3 flex items-center gap-2">
+                📊 分析结果
+              </h2>
+              <ResultTabs
+                results={history}
+                activeIdx={activeHistoryIdx}
+                onSelect={(i) => dispatch({ type: "SELECT_HISTORY_TAB", payload: i })}
               />
-            ) : (
-              <ResultCard
-                result={history[activeHistoryIdx]}
-                streamBuffer=""
-                isStreaming={false}
-              />
-            )}
-          </div>
-        )}
-      </main>
+              {isStreaming ? (
+                <ResultCard
+                  result={null}
+                  streamBuffer={analysis.streamBuffer}
+                  isStreaming
+                />
+              ) : (
+                <ResultCard
+                  result={history[activeHistoryIdx]}
+                  streamBuffer=""
+                  isStreaming={false}
+                />
+              )}
+            </div>
+          )}
+        </main>
+      )}
 
       {/* History Drawer */}
       <HistoryDrawer
         open={state.historyDrawerOpen}
         ossHistory={state.ossHistory}
+        projectsList={state.projects.list}
         onClose={() => dispatch({ type: "CLOSE_HISTORY_DRAWER" })}
         onRestore={handleRestoreFromHistory}
         onDelete={handleDeleteHistoryEntry}
