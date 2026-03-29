@@ -63,15 +63,19 @@ function formatFileSize(bytes) {
 
 // ===== SECTION 4: REDUCER =====
 
+// 从 window._ENV_ 读取运行时环境变量（Docker 注入），回退到空字符串
+const _env = window._ENV_ || {};
+
 const initialState = {
   config: {
-    ossRegion: "",
-    ossBucket: "",
-    ossAccessKeyId: "",
-    ossAccessKeySecret: "",
-    qwenApiKey: "",
+    ossRegion: _env.OSS_REGION || "",
+    ossBucket: _env.OSS_BUCKET || "",
+    ossAccessKeyId: _env.OSS_ACCESS_KEY_ID || "",
+    ossAccessKeySecret: _env.OSS_ACCESS_KEY_SECRET || "",
+    qwenApiKey: _env.QWEN_API_KEY || "",
   },
-  configPanelOpen: true,
+  // 若环境变量已全部注入，配置面板默认收起
+  configPanelOpen: !Object.values(_env).every(v => v && v.trim() !== ""),
 
   upload: {
     phase: "idle", // 'idle'|'validating'|'uploading'|'done'|'error'
