@@ -20,10 +20,10 @@ const QUICK_TAGS = [
 
 // ===== SECTION 3: UTILITY FUNCTIONS =====
 
-async function generateOSSPresignedUrl(config, objectKey, method = "PUT", expiresIn = 7200) {
+async function generateOSSPresignedUrl(config, objectKey, method = "PUT", expiresIn = 7200, contentType = "") {
   const { ossRegion, ossBucket, ossAccessKeyId, ossAccessKeySecret } = config;
   const expiresTimestamp = Math.floor(Date.now() / 1000) + expiresIn;
-  const stringToSign = `${method}\n\n\n${expiresTimestamp}\n/${ossBucket}/${objectKey}`;
+  const stringToSign = `${method}\n\n${contentType}\n${expiresTimestamp}\n/${ossBucket}/${objectKey}`;
 
   const encoder = new TextEncoder();
   const cryptoKey = await window.crypto.subtle.importKey(
@@ -257,11 +257,13 @@ function appReducer(state, action) {
 function useOSSUpload() {
   const upload = useCallback(async (config, file, objectKey, dispatch) => {
     dispatch({ type: "UPLOAD_START" });
-    const uploadUrl = await generateOSSPresignedUrl(config, objectKey, "PUT", 3600);
+    const contentType = file.type || "application/octet-stream";
+    const uploadUrl = await generateOSSPresignedUrl(config, objectKey, "PUT", 3600, contentType);
 
     await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("PUT", uploadUrl);
+      xhr.setRequestHeader("Content-Type", contentType);
 
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
