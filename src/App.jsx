@@ -1192,7 +1192,7 @@ function QueuePanel({ items, activeObjectKey, onClear, onSwitch }) {
     <div className="bg-white border border-gray-200 rounded-xl p-3">
       <div className="flex items-center justify-between mb-2">
         <span className="text-sm font-medium text-gray-700">上传队列（{items.length} 个文件）</span>
-        <button onClick={onClear} className="text-xs text-gray-400 hover:text-gray-600">清空</button>
+        {onClear && <button onClick={onClear} className="text-xs text-gray-400 hover:text-gray-600">清空</button>}
       </div>
       <div className="flex flex-col gap-2">
         {items.map(item => {
@@ -1210,7 +1210,7 @@ function QueuePanel({ items, activeObjectKey, onClear, onSwitch }) {
               <div className="flex items-center justify-between text-xs gap-2">
                 <span className="text-gray-700 font-medium truncate max-w-[160px]">{item.file?.name}</span>
                 <div className="flex items-center gap-1 shrink-0">
-                  {item.status === "done" && !isActive && (
+                  {item.status === "done" && !isActive && onSwitch && (
                     <button
                       onClick={() => onSwitch(item)}
                       className="px-2 py-0.5 text-xs bg-blue-50 text-blue-600 border border-blue-200 rounded hover:bg-blue-100"
@@ -1988,7 +1988,7 @@ function AssetRenameModal({ asset, onSave, onCancel }) {
 }
 
 // --- Asset List (left panel) ---
-function AssetList({ assets, selectedAssetId, filterProjectId, filterType, sortOrder, projectsList, onSelect, onFilterProject, onFilterType, onSortOrder, onUploadClick, onDelete, onRename, uploadProjectId, onUploadProjectChange }) {
+function AssetList({ assets, selectedAssetId, filterProjectId, filterType, sortOrder, projectsList, onSelect, onFilterProject, onFilterType, onSortOrder, onDelete, onRename }) {
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
   let filtered = assets;
@@ -1998,68 +1998,43 @@ function AssetList({ assets, selectedAssetId, filterProjectId, filterType, sortO
   if (sortOrder === "asc") filtered = [...filtered].sort((a, b) => new Date(a.uploadedAt) - new Date(b.uploadedAt));
 
   return (
-    <div className="flex flex-col h-full border-r border-gray-200 bg-white">
-      {/* Toolbar */}
-      <div className="px-3 py-2 border-b border-gray-100 flex flex-col gap-2">
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-sm font-semibold text-gray-700">资产库</span>
-          <div className="flex items-center gap-1.5">
-            {projectsList.length > 0 && (
-              <select
-                value={uploadProjectId || ""}
-                onChange={e => onUploadProjectChange(e.target.value || null)}
-                className="text-xs border border-gray-200 rounded px-1.5 py-1 bg-white text-gray-700 focus:outline-none"
-                title="上传到项目"
-              >
-                <option value="">未分类</option>
-                {projectsList.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </select>
-            )}
+    <div className="flex flex-col flex-1 overflow-hidden">
+      {/* 筛选条 */}
+      <div className="px-2 py-1.5 border-b border-gray-100 flex items-center gap-1.5 flex-wrap shrink-0">
+        <select
+          value={filterProjectId || ""}
+          onChange={e => onFilterProject(e.target.value || null)}
+          className="text-xs border border-gray-200 rounded px-1.5 py-1 bg-white text-gray-700 focus:outline-none flex-1 min-w-0"
+        >
+          <option value="">全部项目</option>
+          {projectsList.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+        <div className="flex items-center rounded border border-gray-200 overflow-hidden text-xs shrink-0">
+          {["all", "video", "image"].map((t, i) => (
             <button
-              onClick={onUploadClick}
-              className="text-xs px-3 py-1.5 bg-blue-700 text-white rounded-lg hover:bg-blue-800 font-medium"
+              key={t}
+              onClick={() => onFilterType(t)}
+              className={`px-1.5 py-1 ${i > 0 ? "border-l border-gray-200" : ""} ${filterType === t ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
             >
-              + 上传
+              {t === "all" ? "全部" : t === "video" ? "视频" : "图片"}
             </button>
-          </div>
+          ))}
         </div>
-        <div className="flex items-center gap-1.5 flex-wrap">
-          <select
-            value={filterProjectId || ""}
-            onChange={e => onFilterProject(e.target.value || null)}
-            className="text-xs border border-gray-200 rounded px-1.5 py-1 bg-white text-gray-700 focus:outline-none"
-          >
-            <option value="">全部项目</option>
-            {projectsList.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-          </select>
-          <div className="flex items-center rounded border border-gray-200 overflow-hidden text-xs">
-            {["all", "video", "image"].map((t, i) => (
-              <button
-                key={t}
-                onClick={() => onFilterType(t)}
-                className={`px-2 py-1 ${i > 0 ? "border-l border-gray-200" : ""} ${filterType === t ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
-              >
-                {t === "all" ? "全部" : t === "video" ? "视频" : "图片"}
-              </button>
-            ))}
-          </div>
-          <button
-            onClick={() => onSortOrder(sortOrder === "desc" ? "asc" : "desc")}
-            className="text-xs px-2 py-1 border border-gray-200 rounded bg-white text-gray-600 hover:bg-gray-50"
-            title="切换排序"
-          >
-            {sortOrder === "desc" ? "↓ 最新" : "↑ 最早"}
-          </button>
-        </div>
+        <button
+          onClick={() => onSortOrder(sortOrder === "desc" ? "asc" : "desc")}
+          className="text-xs px-1.5 py-1 border border-gray-200 rounded bg-white text-gray-600 hover:bg-gray-50 shrink-0"
+          title="切换排序"
+        >
+          {sortOrder === "desc" ? "↓" : "↑"}
+        </button>
       </div>
 
-      {/* Asset list */}
+      {/* 资产列表 */}
       <div className="flex-1 overflow-y-auto">
         {filtered.length === 0 && (
           <div className="flex flex-col items-center justify-center h-48 text-gray-400 text-sm gap-2">
-            <div className="text-4xl">🗂</div>
+            <div className="text-3xl">🗂</div>
             <p>暂无资产</p>
-            <p className="text-xs text-gray-300">点击「上传」添加视频或图片</p>
           </div>
         )}
         {filtered.map(asset => {
@@ -2072,19 +2047,19 @@ function AssetList({ assets, selectedAssetId, filterProjectId, filterType, sortO
               className={`px-3 py-2.5 border-b border-gray-100 cursor-pointer transition-colors ${isSelected ? "bg-blue-50 border-l-2 border-l-blue-500" : "hover:bg-gray-50"}`}
             >
               <div className="flex items-start gap-2">
-                <span className="text-lg shrink-0 mt-0.5">{asset.isImage ? "🖼" : "🎬"}</span>
+                <span className="text-base shrink-0 mt-0.5">{asset.isImage ? "🖼" : "🎬"}</span>
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-gray-800 truncate" title={asset.filename}>{asset.filename}</p>
-                  <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                  <p className="text-xs font-medium text-gray-800 truncate" title={asset.filename}>{asset.filename}</p>
+                  <div className="flex items-center gap-1 mt-0.5 flex-wrap">
                     <span className="text-xs text-gray-400">{new Date(asset.uploadedAt).toLocaleDateString("zh-CN")}</span>
                     {asset.size && <span className="text-xs text-gray-400">{formatFileSize(asset.size)}</span>}
-                    {proj && <span className="text-xs px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded">{proj.name}</span>}
+                    {proj && <span className="text-xs px-1 py-0.5 bg-blue-50 text-blue-600 rounded">{proj.name}</span>}
                   </div>
                   {asset.remark && <p className="text-xs text-gray-400 mt-0.5 truncate">{asset.remark}</p>}
                 </div>
               </div>
               {isSelected && (
-                <div className="flex gap-1 mt-2 ml-7" onClick={e => e.stopPropagation()}>
+                <div className="flex gap-1 mt-1.5 ml-6" onClick={e => e.stopPropagation()}>
                   <button
                     onClick={() => onRename(asset)}
                     className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded"
@@ -2202,6 +2177,8 @@ function AssetLibraryPage({ assetLibrary, upload, analysis, prompt, history, act
   const [renameTarget, setRenameTarget] = useState(null);
 
   const selectedAsset = assetLibrary.assets.find(a => a.id === assetLibrary.selectedAssetId) || null;
+  const isStreaming = analysis.status === "streaming";
+  const canAnalyze = upload.phase === "done" && upload.signedPlayUrl && prompt.text.trim() !== "" && analysis.status !== "streaming";
 
   async function handleRenameConfirm(filename, remark) {
     await onRenameAsset(renameTarget.id, filename, remark);
@@ -2210,62 +2187,136 @@ function AssetLibraryPage({ assetLibrary, upload, analysis, prompt, history, act
 
   return (
     <div className="flex flex-1 overflow-hidden" style={{ minHeight: 0 }}>
-      {/* Left: Asset list (35%) */}
-      <div className="w-[35%] shrink-0 flex flex-col overflow-hidden">
-        <AssetList
-          assets={assetLibrary.assets}
-          selectedAssetId={assetLibrary.selectedAssetId}
-          filterProjectId={assetLibrary.filterProjectId}
-          filterType={assetLibrary.filterType}
-          sortOrder={assetLibrary.sortOrder}
-          projectsList={projectsList}
-          onSelect={onSelectAsset}
-          onFilterProject={onFilterProject}
-          onFilterType={onFilterType}
-          onSortOrder={onSortOrder}
-          onUploadClick={onUploadClick}
-          onDelete={onDeleteAsset}
-          onRename={asset => setRenameTarget(asset)}
-          uploadProjectId={selectedProjectId}
-          onUploadProjectChange={onSelectProject}
-        />
+
+      {/* ── 左栏 1/5：上传工具 + 进度 + 资产列表 ── */}
+      <div className="w-1/5 shrink-0 flex flex-col border-r border-gray-200 bg-white overflow-hidden">
+        {/* 上传工具区 */}
+        <div className="px-3 py-2 border-b border-gray-100 shrink-0">
+          <div className="flex items-center gap-1.5 mb-1">
+            <span className="text-xs font-semibold text-gray-600 shrink-0">资产库</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <select
+              value={selectedProjectId || ""}
+              onChange={e => onSelectProject(e.target.value || null)}
+              className="flex-1 min-w-0 text-xs border border-gray-200 rounded px-1.5 py-1 bg-white text-gray-700 focus:outline-none"
+              title="上传到项目"
+            >
+              <option value="">未分类</option>
+              {projectsList.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            <button
+              onClick={onUploadClick}
+              className="shrink-0 text-xs px-2.5 py-1.5 bg-blue-700 text-white rounded-lg hover:bg-blue-800 font-medium"
+            >
+              + 上传
+            </button>
+          </div>
+        </div>
+
+        {/* 上传进度区 */}
         {queue && queue.items.length > 0 && (
-          <div className="border-t border-gray-100 shrink-0">
-            <QueuePanel
-              items={queue.items}
-              activeObjectKey={null}
-              onClear={null}
-              onSwitch={null}
-            />
+          <div className="border-b border-gray-100 shrink-0 px-2 py-1.5">
+            <QueuePanel items={queue.items} activeObjectKey={null} onClear={null} onSwitch={null} />
           </div>
         )}
-      </div>
 
-      {/* Right: Detail panel (65%) */}
-      <div className="flex-1 overflow-y-auto bg-gray-50">
+        {/* 加载状态 */}
         {assetLibrary.status === "loading" && (
-          <div className="flex items-center justify-center h-48 text-gray-400 text-sm gap-2">
-            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+          <div className="flex items-center justify-center h-20 text-gray-400 text-xs gap-1.5 shrink-0">
+            <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
             </svg>
-            加载资产库…
+            加载中…
           </div>
         )}
+
+        {/* 资产列表 */}
         {assetLibrary.status !== "loading" && (
-          <AssetDetailPanel
-            asset={selectedAsset}
-            upload={upload}
-            analysis={analysis}
-            prompt={prompt}
-            history={history}
-            activeHistoryIdx={activeHistoryIdx}
-            onAnalyze={onAnalyze}
-            onPromptChange={onPromptChange}
-            onQuickTag={onQuickTag}
-            onResetPrompt={onResetPrompt}
-            onSelectHistoryTab={onSelectHistoryTab}
+          <AssetList
+            assets={assetLibrary.assets}
+            selectedAssetId={assetLibrary.selectedAssetId}
+            filterProjectId={assetLibrary.filterProjectId}
+            filterType={assetLibrary.filterType}
+            sortOrder={assetLibrary.sortOrder}
+            projectsList={projectsList}
+            onSelect={onSelectAsset}
+            onFilterProject={onFilterProject}
+            onFilterType={onFilterType}
+            onSortOrder={onSortOrder}
+            onDelete={onDeleteAsset}
+            onRename={asset => setRenameTarget(asset)}
           />
+        )}
+      </div>
+
+      {/* ── 中栏 flex-1（~2/5）：视频播放器 + 提示词 + 分析按钮 ── */}
+      <div className="flex-1 flex flex-col overflow-y-auto p-4 gap-3 border-r border-gray-200 bg-gray-50">
+        {!selectedAsset ? (
+          <div className="flex flex-col items-center justify-center flex-1 text-gray-400 gap-3">
+            <div className="text-5xl">🎬</div>
+            <p className="text-sm">从左侧选择资产</p>
+          </div>
+        ) : (
+          <>
+            {/* 视频/图片预览 */}
+            {upload.phase === "done" && upload.signedPlayUrl ? (
+              selectedAsset.isImage
+                ? <ImagePreview src={upload.signedPlayUrl} filename={selectedAsset.filename} />
+                : <VideoPlayer src={upload.signedPlayUrl} filename={selectedAsset.filename} fileSize={selectedAsset.size} onError={() => {}} />
+            ) : (
+              <div className="flex items-center justify-center bg-gray-200 rounded-xl text-gray-400 text-sm" style={{ aspectRatio: "16/9" }}>
+                加载预览中…
+              </div>
+            )}
+
+            {/* 资产信息 */}
+            <div className="flex items-center gap-2 flex-wrap text-xs text-gray-500">
+              <span>{selectedAsset.isImage ? "🖼 图片" : "🎬 视频"}</span>
+              {selectedAsset.size > 0 && <span>{formatFileSize(selectedAsset.size)}</span>}
+              {selectedAsset.duration && <span>{Math.floor(selectedAsset.duration / 60)}:{String(Math.floor(selectedAsset.duration % 60)).padStart(2, "0")}</span>}
+              {selectedAsset.width && selectedAsset.height && <span>{selectedAsset.width}×{selectedAsset.height}</span>}
+              <span>{new Date(selectedAsset.uploadedAt).toLocaleString("zh-CN")}</span>
+            </div>
+
+            {/* 提示词 */}
+            <PromptEditor prompt={prompt} onPromptChange={onPromptChange} onQuickTag={onQuickTag} onReset={onResetPrompt} />
+
+            {/* 分析按钮 */}
+            <AnalysisButton status={analysis.status} onClick={onAnalyze} disabled={!canAnalyze} />
+
+            {/* 错误提示 */}
+            {(analysis.status === "error" || analysis.status === "timeout") && (
+              <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm text-red-700">
+                ⚠️ {analysis.errorMessage}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* ── 右栏 2/5：AI 分析结果 ── */}
+      <div className="w-2/5 shrink-0 flex flex-col overflow-y-auto p-4 bg-white">
+        {!selectedAsset ? (
+          <div className="flex flex-col items-center justify-center flex-1 text-gray-400 gap-3">
+            <div className="text-5xl">📊</div>
+            <p className="text-sm">选择资产后可进行 AI 分析</p>
+          </div>
+        ) : !(isStreaming || history.length > 0) ? (
+          <div className="flex flex-col items-center justify-center flex-1 text-gray-400 gap-2">
+            <div className="text-4xl">💡</div>
+            <p className="text-sm">点击「开始视频分析」获取 AI 洞察</p>
+          </div>
+        ) : (
+          <>
+            <h2 className="font-semibold text-gray-700 mb-3 text-sm flex items-center gap-2">📊 分析结果</h2>
+            <ResultTabs results={history} activeIdx={activeHistoryIdx} onSelect={onSelectHistoryTab} />
+            {isStreaming
+              ? <ResultCard result={null} streamBuffer={analysis.streamBuffer} isStreaming />
+              : <ResultCard result={history[activeHistoryIdx]} streamBuffer="" isStreaming={false} />
+            }
+          </>
         )}
       </div>
 
