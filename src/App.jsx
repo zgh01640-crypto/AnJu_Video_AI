@@ -4,8 +4,11 @@ import { useState, useReducer, useRef, useCallback, useEffect } from "react";
 // ===== SECTION 2: CONSTANTS =====
 const DEFAULT_PROMPT = "请分析工程视频，正在进行哪些专业施工，形象进度如何";
 const MAX_FILE_SIZE = 200 * 1024 * 1024; // 200MB
-const ALLOWED_TYPES = ["video/mp4", "video/quicktime", "video/x-msvideo"];
-const ALLOWED_EXTS = [".mp4", ".mov", ".avi"];
+const MAX_IMAGE_SIZE = 20 * 1024 * 1024;  // 20MB
+const ALLOWED_TYPES = ["video/mp4", "video/quicktime", "video/x-msvideo", "image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"];
+const ALLOWED_EXTS = [".mp4", ".mov", ".avi", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"];
+const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"]);
+const ALLOWED_IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"]);
 const ANALYSIS_TIMEOUT_MS = 120000;
 const MAX_PROMPT_CHARS = 500;
 const QWEN_ENDPOINT =
@@ -183,6 +186,78 @@ async function deleteOSSHistoryEntry(config, entry) {
   await updateOSSIndex(config, objectKey, "remove", entry.projectId || null);
 }
 
+// ===== v3.0: ASSET MANIFEST UTILITIES =====
+
+async function loadAssetManifest(config, projectId) {
+  const prefix = projectId || "unassigned";
+  const objectKey = `assets/${prefix}/manifest.json`;
+  try {
+    const getUrl = await generateOSSPresignedUrl(config, objectKey, "GET", 300);
+    const res = await fetch(getUrl);
+    if (res.status === 404) return [];
+    if (!res.ok) throw new Error(`manifest load failed: ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    if (err.message && err.message.includes("404")) return [];
+    return [];
+  }
+}
+
+async function saveAssetManifest(config, projectId, manifest) {
+  const prefix = projectId || "unassigned";
+  const objectKey = `assets/${prefix}/manifest.json`;
+  const blob = new Blob([JSON.stringify(manifest)], { type: "application/json" });
+  const putUrl = await generateOSSPresignedUrl(config, objectKey, "PUT", 3600, "application/json");
+  const res = await fetch(putUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: blob,
+  });
+  if (!res.ok) throw new Error(`manifest PUT failed: ${res.status}`);
+}
+
+async function deleteOSSObject(config, objectKey) {
+  try {
+    const deleteUrl = await generateOSSPresignedUrl(config, objectKey, "DELETE", 300);
+    const res = await fetch(deleteUrl, { method: "DELETE" });
+    if (res.status === 404) return; // already gone
+    if (res.status === 403) throw new Error(`DELETE forbidden (403): ${objectKey}`);
+    // other non-2xx: swallow silently
+  } catch (err) {
+    if (err.message && err.message.includes("403")) throw err;
+    // network/CORS errors: swallow
+  }
+}
+
+async function loadAllProjectManifests(config, projectsList) {
+  const projectIds = [null, ...projectsList.map(p => p.id)];
+  const results = await Promise.allSettled(
+    projectIds.map(pid => loadAssetManifest(config, pid))
+  );
+  const all = results
+    .filter(r => r.status === "fulfilled")
+    .flatMap(r => r.value);
+  // deduplicate by id
+  const seen = new Set();
+  const unique = all.filter(a => {
+    if (seen.has(a.id)) return false;
+    seen.add(a.id);
+    return true;
+  });
+  return unique.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+}
+
+async function patchAssetInManifest(config, projectId, assetId, patch) {
+  const manifest = await loadAssetManifest(config, projectId);
+  let updated;
+  if (patch === null) {
+    updated = manifest.filter(a => a.id !== assetId);
+  } else {
+    updated = manifest.map(a => a.id === assetId ? { ...a, ...patch } : a);
+  }
+  await saveAssetManifest(config, projectId, updated);
+}
+
 // ===== PROJECT PERSISTENCE =====
 
 async function saveProjectsToOSS(config, projects) {
@@ -227,6 +302,23 @@ function probeVideoFile(file) {
   });
 }
 
+// 从 File 对象提取图片元数据（分辨率）
+function probeImageFile(file) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      resolve({ width: img.naturalWidth, height: img.naturalHeight, duration: null });
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => {
+      resolve({ width: null, height: null, duration: null });
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  });
+}
+
 // ===== SECTION 4: REDUCER =====
 
 // 从 window._ENV_ 读取运行时环境变量（Docker 注入），回退到空字符串
@@ -251,6 +343,7 @@ const initialState = {
     progress: 0,
     errorCode: null,
     errorMessage: "",
+    isImage: false,
   },
 
   prompt: {
@@ -291,8 +384,19 @@ const initialState = {
     list: [],
     errorMessage: "",
   },
-  currentPage: "analysis",   // 'analysis' | 'projects'
+  currentPage: "library",   // 'library' | 'analysis' | 'projects'
   selectedProjectId: null,   // 上传时选择的项目 ID
+
+  // v3.0: 资产库
+  assetLibrary: {
+    status: "idle",          // 'idle'|'loading'|'loaded'|'error'
+    assets: [],              // AssetEntry[]
+    selectedAssetId: null,   // string | null
+    filterProjectId: null,   // string | null
+    filterType: "all",       // 'all'|'video'|'image'
+    sortOrder: "desc",       // 'desc'|'asc'
+    errorMessage: "",
+  },
 };
 
 function appReducer(state, action) {
@@ -403,6 +507,7 @@ function appReducer(state, action) {
         elapsedMs: action.payload.elapsedMs,
         videoObjectKey: state.upload.objectKey,
         projectId: state.selectedProjectId,
+        isImage: state.upload.isImage,
       };
       const newHistory = [entry, ...state.history].slice(0, 3);
       return {
@@ -485,6 +590,7 @@ function appReducer(state, action) {
           objectKey: entry.videoObjectKey,
           signedPlayUrl,
           progress: 100, errorCode: null, errorMessage: "",
+          isImage: entry.isImage ?? false,
         },
         history: [entry],
         activeHistoryIdx: 0,
@@ -538,6 +644,7 @@ function appReducer(state, action) {
           progress: 100,
           errorCode: null,
           errorMessage: "",
+          isImage: doneItem?.isImage ?? false,
         },
         analysis: { ...initialState.analysis },
       };
@@ -569,6 +676,7 @@ function appReducer(state, action) {
           progress: 100,
           errorCode: null,
           errorMessage: "",
+          isImage: item.isImage ?? false,
         },
         analysis: { ...initialState.analysis },
       };
@@ -602,6 +710,82 @@ function appReducer(state, action) {
         ...state,
         projects: { ...state.projects, list: state.projects.list.filter(p => p.id !== action.payload) },
         selectedProjectId: state.selectedProjectId === action.payload ? null : state.selectedProjectId,
+      };
+
+    // ===== v3.0: ASSET LIBRARY ACTIONS =====
+    case "NAVIGATE_TO_LIBRARY":
+      return { ...state, currentPage: "library" };
+
+    case "ASSET_LIBRARY_LOADING":
+      return { ...state, assetLibrary: { ...state.assetLibrary, status: "loading" } };
+    case "ASSET_LIBRARY_LOADED":
+      return { ...state, assetLibrary: { ...state.assetLibrary, status: "loaded", assets: action.payload.assets, errorMessage: "" } };
+    case "ASSET_LIBRARY_ERROR":
+      return { ...state, assetLibrary: { ...state.assetLibrary, status: "error", errorMessage: action.payload.message } };
+    case "ASSET_LIBRARY_ASSET_ADDED":
+      return {
+        ...state,
+        assetLibrary: { ...state.assetLibrary, assets: [action.payload.asset, ...state.assetLibrary.assets] },
+      };
+
+    case "SELECT_ASSET": {
+      const asset = state.assetLibrary.assets.find(a => a.id === action.payload);
+      if (!asset) return { ...state, assetLibrary: { ...state.assetLibrary, selectedAssetId: action.payload } };
+      return {
+        ...state,
+        assetLibrary: { ...state.assetLibrary, selectedAssetId: action.payload },
+        upload: {
+          phase: "done",
+          file: null,
+          objectKey: asset.objectKey,
+          signedPlayUrl: null, // filled by async handler
+          progress: 100,
+          errorCode: null,
+          errorMessage: "",
+          isImage: asset.isImage,
+        },
+        analysis: { ...initialState.analysis },
+        history: [],
+        activeHistoryIdx: 0,
+        selectedProjectId: asset.projectId || null,
+      };
+    }
+
+    case "SET_ASSET_FILTER_PROJECT":
+      return { ...state, assetLibrary: { ...state.assetLibrary, filterProjectId: action.payload } };
+    case "SET_ASSET_FILTER_TYPE":
+      return { ...state, assetLibrary: { ...state.assetLibrary, filterType: action.payload } };
+    case "SET_ASSET_SORT_ORDER":
+      return { ...state, assetLibrary: { ...state.assetLibrary, sortOrder: action.payload } };
+
+    case "ASSET_DELETED": {
+      const wasSelected = state.assetLibrary.selectedAssetId === action.payload;
+      return {
+        ...state,
+        assetLibrary: {
+          ...state.assetLibrary,
+          assets: state.assetLibrary.assets.filter(a => a.id !== action.payload),
+          selectedAssetId: wasSelected ? null : state.assetLibrary.selectedAssetId,
+        },
+        ...(wasSelected ? {
+          upload: { ...initialState.upload },
+          analysis: { ...initialState.analysis },
+          history: [],
+          activeHistoryIdx: 0,
+        } : {}),
+      };
+    }
+    case "ASSET_RENAMED":
+      return {
+        ...state,
+        assetLibrary: {
+          ...state.assetLibrary,
+          assets: state.assetLibrary.assets.map(a =>
+            a.id === action.payload.id
+              ? { ...a, filename: action.payload.filename, remark: action.payload.remark }
+              : a
+          ),
+        },
       };
 
     default:
@@ -643,7 +827,7 @@ function useOSSPersistence() {
   return { persistEntry, loadHistory, deleteEntry };
 }
 
-function useQueueProcessor(state, dispatch) {
+function useQueueProcessor(state, dispatch, onItemDone) {
   const { upload: ossUpload } = useOSSUpload();
 
   useEffect(() => {
@@ -666,6 +850,7 @@ function useQueueProcessor(state, dispatch) {
       .then(async () => {
         const signedPlayUrl = await generateOSSPresignedUrl(state.config, next.objectKey, "GET", 7200);
         dispatch({ type: "QUEUE_ITEM_DONE", payload: { id: next.id, signedPlayUrl } });
+        if (onItemDone) onItemDone(next, signedPlayUrl);
       })
       .catch(err => {
         dispatch({
@@ -722,7 +907,10 @@ function useOSSUpload() {
 
 function useQwenAnalysis() {
   const analyze = useCallback(
-    async (config, signedPlayUrl, promptText, dispatch, abortSignal) => {
+    async (config, signedPlayUrl, promptText, dispatch, abortSignal, isImage = false) => {
+      const mediaContent = isImage
+        ? { type: "image_url", image_url: { url: signedPlayUrl } }
+        : { type: "video_url", video_url: { url: signedPlayUrl } };
       const response = await fetch(QWEN_ENDPOINT, {
         method: "POST",
         headers: {
@@ -736,7 +924,7 @@ function useQwenAnalysis() {
             {
               role: "user",
               content: [
-                { type: "video_url", video_url: { url: signedPlayUrl } },
+                mediaContent,
                 { type: "text", text: promptText },
               ],
             },
@@ -977,13 +1165,13 @@ function UploadZone({ onFilesSelected, uploadError, onClearError }) {
         <p className="text-gray-600 font-medium text-center px-4">
           拖拽视频文件至此，或点击选择
         </p>
-        <p className="text-gray-400 text-sm mt-1">支持 MP4、MOV、AVI，最大 200MB，可多选</p>
+        <p className="text-gray-400 text-sm mt-1">视频：MP4/MOV/AVI ≤200MB · 图片：JPG/PNG/WEBP/GIF ≤20MB · 可多选</p>
       </div>
       <input
         ref={inputRef}
         type="file"
         multiple
-        accept=".mp4,.mov,.avi,video/mp4,video/quicktime,video/x-msvideo"
+        accept=".mp4,.mov,.avi,.jpg,.jpeg,.png,.webp,.gif,.bmp,video/mp4,video/quicktime,video/x-msvideo,image/jpeg,image/png,image/webp,image/gif,image/bmp"
         onChange={handleChange}
         className="hidden"
       />
@@ -1268,6 +1456,22 @@ function VideoPlayer({ src, filename, fileSize, onError }) {
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+// --- Image Preview ---
+function ImagePreview({ src, filename }) {
+  return (
+    <div
+      className="relative bg-black rounded-xl overflow-hidden"
+      style={{ aspectRatio: "16/9" }}
+    >
+      <img
+        src={src}
+        alt={filename || "图片预览"}
+        className="w-full h-full object-contain"
+      />
     </div>
   );
 }
@@ -1727,12 +1931,338 @@ function ProjectManagementPage({ projects, ossHistory, config, onBack, onProject
   );
 }
 
+// ===== v3.0: ASSET LIBRARY COMPONENTS =====
+
+// --- Asset Rename Modal ---
+function AssetRenameModal({ asset, onSave, onCancel }) {
+  const [filename, setFilename] = useState(asset.filename);
+  const [remark, setRemark] = useState(asset.remark || "");
+  const [saving, setSaving] = useState(false);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (!filename.trim()) return;
+    setSaving(true);
+    try {
+      await onSave(filename.trim(), remark.trim());
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-40 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md">
+        <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">重命名 / 备注</h3>
+          <button onClick={onCancel} className="text-gray-400 hover:text-gray-700 text-xl">×</button>
+        </div>
+        <form onSubmit={handleSubmit} className="p-6 flex flex-col gap-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">文件名 <span className="text-red-500">*</span></label>
+            <input
+              value={filename}
+              onChange={e => setFilename(e.target.value)}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">备注</label>
+            <input
+              value={remark}
+              onChange={e => setRemark(e.target.value)}
+              placeholder="可选备注…"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+            />
+          </div>
+          <div className="flex justify-end gap-3 pt-2">
+            <button type="button" onClick={onCancel} className="px-5 py-2 rounded-lg text-sm text-gray-600 bg-gray-100 hover:bg-gray-200">取消</button>
+            <button type="submit" disabled={saving || !filename.trim()} className="px-5 py-2 rounded-lg text-sm font-medium text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-40">
+              {saving ? "保存中…" : "保存"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// --- Asset List (left panel) ---
+function AssetList({ assets, selectedAssetId, filterProjectId, filterType, sortOrder, projectsList, onSelect, onFilterProject, onFilterType, onSortOrder, onUploadClick, onDelete, onRename }) {
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  let filtered = assets;
+  if (filterProjectId) filtered = filtered.filter(a => a.projectId === filterProjectId);
+  if (filterType === "video") filtered = filtered.filter(a => !a.isImage);
+  if (filterType === "image") filtered = filtered.filter(a => a.isImage);
+  if (sortOrder === "asc") filtered = [...filtered].sort((a, b) => new Date(a.uploadedAt) - new Date(b.uploadedAt));
+
+  return (
+    <div className="flex flex-col h-full border-r border-gray-200 bg-white">
+      {/* Toolbar */}
+      <div className="px-3 py-2 border-b border-gray-100 flex flex-col gap-2">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-sm font-semibold text-gray-700">资产库</span>
+          <button
+            onClick={onUploadClick}
+            className="text-xs px-3 py-1.5 bg-blue-700 text-white rounded-lg hover:bg-blue-800 font-medium"
+          >
+            + 上传
+          </button>
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <select
+            value={filterProjectId || ""}
+            onChange={e => onFilterProject(e.target.value || null)}
+            className="text-xs border border-gray-200 rounded px-1.5 py-1 bg-white text-gray-700 focus:outline-none"
+          >
+            <option value="">全部项目</option>
+            {projectsList.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <div className="flex items-center rounded border border-gray-200 overflow-hidden text-xs">
+            {["all", "video", "image"].map((t, i) => (
+              <button
+                key={t}
+                onClick={() => onFilterType(t)}
+                className={`px-2 py-1 ${i > 0 ? "border-l border-gray-200" : ""} ${filterType === t ? "bg-blue-600 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
+              >
+                {t === "all" ? "全部" : t === "video" ? "视频" : "图片"}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => onSortOrder(sortOrder === "desc" ? "asc" : "desc")}
+            className="text-xs px-2 py-1 border border-gray-200 rounded bg-white text-gray-600 hover:bg-gray-50"
+            title="切换排序"
+          >
+            {sortOrder === "desc" ? "↓ 最新" : "↑ 最早"}
+          </button>
+        </div>
+      </div>
+
+      {/* Asset list */}
+      <div className="flex-1 overflow-y-auto">
+        {filtered.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-48 text-gray-400 text-sm gap-2">
+            <div className="text-4xl">🗂</div>
+            <p>暂无资产</p>
+            <p className="text-xs text-gray-300">点击「上传」添加视频或图片</p>
+          </div>
+        )}
+        {filtered.map(asset => {
+          const isSelected = asset.id === selectedAssetId;
+          const proj = projectsList.find(p => p.id === asset.projectId);
+          return (
+            <div
+              key={asset.id}
+              onClick={() => onSelect(asset.id)}
+              className={`px-3 py-2.5 border-b border-gray-100 cursor-pointer transition-colors ${isSelected ? "bg-blue-50 border-l-2 border-l-blue-500" : "hover:bg-gray-50"}`}
+            >
+              <div className="flex items-start gap-2">
+                <span className="text-lg shrink-0 mt-0.5">{asset.isImage ? "🖼" : "🎬"}</span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-gray-800 truncate" title={asset.filename}>{asset.filename}</p>
+                  <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                    <span className="text-xs text-gray-400">{new Date(asset.uploadedAt).toLocaleDateString("zh-CN")}</span>
+                    {asset.size && <span className="text-xs text-gray-400">{formatFileSize(asset.size)}</span>}
+                    {proj && <span className="text-xs px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded">{proj.name}</span>}
+                  </div>
+                  {asset.remark && <p className="text-xs text-gray-400 mt-0.5 truncate">{asset.remark}</p>}
+                </div>
+              </div>
+              {isSelected && (
+                <div className="flex gap-1 mt-2 ml-7" onClick={e => e.stopPropagation()}>
+                  <button
+                    onClick={() => onRename(asset)}
+                    className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded"
+                  >
+                    重命名
+                  </button>
+                  {confirmDeleteId === asset.id ? (
+                    <div className="flex gap-1">
+                      <button
+                        onClick={() => { onDelete(asset); setConfirmDeleteId(null); }}
+                        className="text-xs px-2 py-0.5 bg-red-500 text-white rounded hover:bg-red-600"
+                      >确认</button>
+                      <button
+                        onClick={() => setConfirmDeleteId(null)}
+                        className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded"
+                      >取消</button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmDeleteId(asset.id)}
+                      className="text-xs px-2 py-0.5 bg-gray-100 hover:bg-red-50 hover:text-red-500 text-gray-500 rounded"
+                    >
+                      删除
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// --- Asset Detail Panel (right panel) ---
+function AssetDetailPanel({ asset, upload, analysis, prompt, history, activeHistoryIdx, onAnalyze, onPromptChange, onQuickTag, onResetPrompt, onSelectHistoryTab }) {
+  if (!asset) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-gray-400 gap-3">
+        <div className="text-6xl">🗂</div>
+        <p className="text-sm">从左侧选择资产以查看详情或进行 AI 分析</p>
+      </div>
+    );
+  }
+
+  const isStreaming = analysis.status === "streaming";
+  const canAnalyze = upload.phase === "done" && upload.signedPlayUrl && prompt.text.trim() !== "" && analysis.status !== "streaming";
+
+  return (
+    <div className="flex flex-col gap-4 p-4 overflow-y-auto h-full">
+      {/* Media preview */}
+      {upload.phase === "done" && upload.signedPlayUrl ? (
+        asset.isImage ? (
+          <ImagePreview src={upload.signedPlayUrl} filename={asset.filename} />
+        ) : (
+          <VideoPlayer src={upload.signedPlayUrl} filename={asset.filename} fileSize={asset.size} onError={() => {}} />
+        )
+      ) : upload.phase === "done" && !upload.signedPlayUrl ? (
+        <div className="flex items-center justify-center bg-gray-100 rounded-xl text-gray-400 text-sm" style={{ aspectRatio: "16/9" }}>
+          加载预览中…
+        </div>
+      ) : null}
+
+      {/* Asset info */}
+      <div className="flex items-center gap-2 flex-wrap text-xs text-gray-500">
+        <span>{asset.isImage ? "🖼 图片" : "🎬 视频"}</span>
+        {asset.size && <span>{formatFileSize(asset.size)}</span>}
+        {asset.duration && <span>{Math.floor(asset.duration / 60)}:{String(Math.floor(asset.duration % 60)).padStart(2, "0")}</span>}
+        {asset.width && asset.height && <span>{asset.width}×{asset.height}</span>}
+        <span>{new Date(asset.uploadedAt).toLocaleString("zh-CN")}</span>
+        {asset.remark && <span className="text-gray-400">• {asset.remark}</span>}
+      </div>
+
+      {/* Prompt editor */}
+      <PromptEditor
+        prompt={prompt}
+        onPromptChange={onPromptChange}
+        onQuickTag={onQuickTag}
+        onReset={onResetPrompt}
+      />
+
+      {/* Analysis button */}
+      <AnalysisButton
+        status={analysis.status}
+        onClick={onAnalyze}
+        disabled={!canAnalyze}
+      />
+
+      {/* Analysis error / timeout */}
+      {(analysis.status === "error" || analysis.status === "timeout") && (
+        <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm text-red-700">
+          ⚠️ {analysis.errorMessage}
+        </div>
+      )}
+
+      {/* Results */}
+      {(isStreaming || history.length > 0) && (
+        <div>
+          <h2 className="font-semibold text-gray-700 mb-3 flex items-center gap-2">📊 分析结果</h2>
+          <ResultTabs results={history} activeIdx={activeHistoryIdx} onSelect={onSelectHistoryTab} />
+          {isStreaming ? (
+            <ResultCard result={null} streamBuffer={analysis.streamBuffer} isStreaming />
+          ) : (
+            <ResultCard result={history[activeHistoryIdx]} streamBuffer="" isStreaming={false} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- Asset Library Page (main container) ---
+function AssetLibraryPage({ assetLibrary, upload, analysis, prompt, history, activeHistoryIdx, projectsList, onSelectAsset, onFilterProject, onFilterType, onSortOrder, onUploadClick, onDeleteAsset, onRenameAsset, onAnalyze, onPromptChange, onQuickTag, onResetPrompt, onSelectHistoryTab }) {
+  const [renameTarget, setRenameTarget] = useState(null);
+
+  const selectedAsset = assetLibrary.assets.find(a => a.id === assetLibrary.selectedAssetId) || null;
+
+  async function handleRenameConfirm(filename, remark) {
+    await onRenameAsset(renameTarget.id, filename, remark);
+    setRenameTarget(null);
+  }
+
+  return (
+    <div className="flex flex-1 overflow-hidden" style={{ minHeight: 0 }}>
+      {/* Left: Asset list (35%) */}
+      <div className="w-[35%] shrink-0 flex flex-col overflow-hidden">
+        <AssetList
+          assets={assetLibrary.assets}
+          selectedAssetId={assetLibrary.selectedAssetId}
+          filterProjectId={assetLibrary.filterProjectId}
+          filterType={assetLibrary.filterType}
+          sortOrder={assetLibrary.sortOrder}
+          projectsList={projectsList}
+          onSelect={onSelectAsset}
+          onFilterProject={onFilterProject}
+          onFilterType={onFilterType}
+          onSortOrder={onSortOrder}
+          onUploadClick={onUploadClick}
+          onDelete={onDeleteAsset}
+          onRename={asset => setRenameTarget(asset)}
+        />
+      </div>
+
+      {/* Right: Detail panel (65%) */}
+      <div className="flex-1 overflow-y-auto bg-gray-50">
+        {assetLibrary.status === "loading" && (
+          <div className="flex items-center justify-center h-48 text-gray-400 text-sm gap-2">
+            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+            </svg>
+            加载资产库…
+          </div>
+        )}
+        {assetLibrary.status !== "loading" && (
+          <AssetDetailPanel
+            asset={selectedAsset}
+            upload={upload}
+            analysis={analysis}
+            prompt={prompt}
+            history={history}
+            activeHistoryIdx={activeHistoryIdx}
+            onAnalyze={onAnalyze}
+            onPromptChange={onPromptChange}
+            onQuickTag={onQuickTag}
+            onResetPrompt={onResetPrompt}
+            onSelectHistoryTab={onSelectHistoryTab}
+          />
+        )}
+      </div>
+
+      {/* Rename Modal */}
+      {renameTarget && (
+        <AssetRenameModal
+          asset={renameTarget}
+          onSave={handleRenameConfirm}
+          onCancel={() => setRenameTarget(null)}
+        />
+      )}
+    </div>
+  );
+}
+
 // ===== SECTION 7: MAIN APP COMPONENT =====
 
 export default function App() {
   const [state, dispatch] = useReducer(appReducer, initialState);
   const abortControllerRef = useRef(null);
   const timeoutHandleRef = useRef(null);
+  const uploadInputRef = useRef(null);
   const { upload: ossUpload } = useOSSUpload();
   const { analyze: qwenAnalyze } = useQwenAnalysis();
   const { persistEntry, loadHistory, deleteEntry } = useOSSPersistence();
@@ -1740,26 +2270,59 @@ export default function App() {
   const isConfigured = Object.values(state.config).every((v) => v.trim() !== "");
   const canAnalyze =
     state.upload.phase === "done" &&
+    state.upload.signedPlayUrl &&
     state.prompt.text.trim() !== "" &&
     state.analysis.status !== "streaming";
 
-  // 启动时从 OSS 加载项目列表和历史记录
+  // 启动时从 OSS 加载项目列表、历史记录、资产清单
   useEffect(() => {
     if (!isConfigured) return;
     dispatch({ type: "PROJECTS_LOADING" });
+    dispatch({ type: "ASSET_LIBRARY_LOADING" });
     loadProjectsFromOSS(state.config)
       .then(list => {
         dispatch({ type: "PROJECTS_LOADED", payload: { list } });
-        return loadHistory(state.config, list, dispatch);
+        // 并行加载：历史记录 + 资产清单
+        return Promise.all([
+          loadHistory(state.config, list, dispatch),
+          loadAllProjectManifests(state.config, list)
+            .then(assets => dispatch({ type: "ASSET_LIBRARY_LOADED", payload: { assets } }))
+            .catch(err => dispatch({ type: "ASSET_LIBRARY_ERROR", payload: { message: err.message } })),
+        ]);
       })
       .catch(() => {
         dispatch({ type: "PROJECTS_ERROR", payload: { message: "项目加载失败" } });
+        dispatch({ type: "ASSET_LIBRARY_LOADED", payload: { assets: [] } });
         loadHistory(state.config, [], dispatch);
       });
   }, []);
 
+  // 上传完成后写入资产清单并跳转资产库
+  const handleItemDone = useCallback(async (queueItem, signedPlayUrl) => {
+    const asset = {
+      id: crypto.randomUUID(),
+      objectKey: queueItem.objectKey,
+      filename: queueItem.file?.name || queueItem.objectKey.split("/").pop(),
+      remark: "",
+      isImage: queueItem.isImage ?? false,
+      size: queueItem.meta?.size || 0,
+      duration: queueItem.meta?.duration || null,
+      width: queueItem.meta?.width || null,
+      height: queueItem.meta?.height || null,
+      uploadedAt: new Date().toISOString(),
+      projectId: queueItem.projectId || null,
+    };
+    // 写入 OSS manifest（fire-and-forget）
+    saveAssetManifest(state.config, asset.projectId, [
+      asset,
+      ...(await loadAssetManifest(state.config, asset.projectId)),
+    ]).catch(() => {});
+    dispatch({ type: "ASSET_LIBRARY_ASSET_ADDED", payload: { asset } });
+    dispatch({ type: "NAVIGATE_TO_LIBRARY" });
+  }, [state.config]);
+
   // 队列处理器
-  useQueueProcessor(state, dispatch);
+  useQueueProcessor(state, dispatch, handleItemDone);
 
   // persistError 自动清除
   useEffect(() => {
@@ -1785,16 +2348,20 @@ export default function App() {
         errors.push(`${file.name}：格式不支持`);
         continue;
       }
-      if (file.size > MAX_FILE_SIZE) {
-        errors.push(`${file.name}：超过 200MB`);
+      const isImage = IMAGE_MIME_TYPES.has(file.type) || ALLOWED_IMAGE_EXTS.has(ext);
+      const sizeLimit = isImage ? MAX_IMAGE_SIZE : MAX_FILE_SIZE;
+      const sizeLimitLabel = isImage ? "20MB" : "200MB";
+      if (file.size > sizeLimit) {
+        errors.push(`${file.name}：超过 ${sizeLimitLabel}`);
         continue;
       }
-      const meta = await probeVideoFile(file);
+      const meta = isImage ? await probeImageFile(file) : await probeVideoFile(file);
       validItems.push({
         id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
         file,
         objectKey: buildOSSObjectKey(file.name, state.selectedProjectId),
         projectId: state.selectedProjectId,
+        isImage,
         status: "waiting",
         progress: 0,
         errorMessage: "",
@@ -1816,6 +2383,33 @@ export default function App() {
         payload: { errorCode: "E001", errorMessage: errors.join("；") },
       });
     }
+  }
+
+  async function handleSelectAsset(assetId) {
+    dispatch({ type: "SELECT_ASSET", payload: assetId });
+    const asset = state.assetLibrary.assets.find(a => a.id === assetId);
+    if (!asset) return;
+    try {
+      const signedPlayUrl = await generateOSSPresignedUrl(state.config, asset.objectKey, "GET", 7200);
+      dispatch({ type: "UPLOAD_DONE", payload: { signedPlayUrl } });
+    } catch { /* leave signedPlayUrl null */ }
+  }
+
+  async function handleDeleteAsset(asset) {
+    try {
+      await deleteOSSObject(state.config, asset.objectKey);
+    } catch { /* log but continue */ }
+    try {
+      await patchAssetInManifest(state.config, asset.projectId, asset.id, null);
+    } catch { /* log but continue */ }
+    dispatch({ type: "ASSET_DELETED", payload: asset.id });
+  }
+
+  async function handleRenameAsset(assetId, filename, remark) {
+    const asset = state.assetLibrary.assets.find(a => a.id === assetId);
+    if (!asset) return;
+    await patchAssetInManifest(state.config, asset.projectId, assetId, { filename, remark });
+    dispatch({ type: "ASSET_RENAMED", payload: { id: assetId, filename, remark } });
   }
 
   async function handleAnalyze() {
@@ -1844,12 +2438,12 @@ export default function App() {
     };
 
     try {
-      await qwenAnalyze(state.config, freshUrl, state.prompt.text, trackingDispatch, ac.signal);
+      await qwenAnalyze(state.config, freshUrl, state.prompt.text, trackingDispatch, ac.signal, state.upload.isImage);
       clearTimeout(timeoutHandleRef.current);
       const elapsedMs = Date.now() - startedAt;
       dispatch({ type: "ANALYSIS_DONE", payload: { elapsedMs } });
 
-      // Feature 1: 持久化分析结果到 OSS（fire-and-forget）
+      // 持久化分析结果到 OSS（fire-and-forget）
       const entry = {
         id: `${Date.now()}`,
         timestamp: new Date(),
@@ -1858,8 +2452,8 @@ export default function App() {
         elapsedMs,
         videoObjectKey: state.upload.objectKey,
         projectId: state.selectedProjectId,
+        isImage: state.upload.isImage,
       };
-      // 立即更新本地历史列表，无需等待 OSS 写入
       dispatch({ type: "OSS_HISTORY_ENTRY_ADDED", payload: { entry } });
       persistEntry(state.config, entry, dispatch);
     } catch (err) {
@@ -1898,7 +2492,6 @@ export default function App() {
 
   function handleVideoError() {
     // E004: signed URL expired or network issue
-    // User should refresh the page
   }
 
   // --- Render ---
@@ -1912,7 +2505,7 @@ export default function App() {
       {/* Header */}
       <header className="bg-blue-800 text-white px-5 py-3 flex items-center justify-between shadow">
         <h1 className="text-base font-semibold tracking-wide">
-          🏗 深圳市安居集团 · 工程视频分析智能体（v1.1）
+          🏗 安居集团工程视频资产AI-Insight智能体（v3.0）
         </h1>
         <div className="flex items-center gap-4">
           {isConfigured && (
@@ -1921,6 +2514,15 @@ export default function App() {
               <span className="text-blue-500">|</span>
               <span title="OSS 存储" className="max-w-[180px] truncate">🗄 {state.config.ossRegion}</span>
             </div>
+          )}
+          {isConfigured && (
+            <button
+              onClick={() => dispatch({ type: "NAVIGATE_TO_LIBRARY" })}
+              title="资产库"
+              className={`transition-colors text-lg ${state.currentPage === "library" ? "text-white" : "text-blue-200 hover:text-white"}`}
+            >
+              🗂
+            </button>
           )}
           {isConfigured && (
             <button
@@ -1967,20 +2569,56 @@ export default function App() {
         />
       )}
 
+      {/* Hidden upload input for AssetLibraryPage */}
+      <input
+        ref={uploadInputRef}
+        type="file"
+        multiple
+        accept=".mp4,.mov,.avi,.jpg,.jpeg,.png,.webp,.gif,.bmp,video/mp4,video/quicktime,video/x-msvideo,image/jpeg,image/png,image/webp,image/gif,image/bmp"
+        className="hidden"
+        onChange={e => {
+          const files = Array.from(e.target.files);
+          if (files.length > 0) handleFilesSelected(files);
+          e.target.value = "";
+        }}
+      />
+
       {/* Page Routing */}
       {state.currentPage === "projects" ? (
         <ProjectManagementPage
           projects={state.projects}
           ossHistory={state.ossHistory}
           config={state.config}
-          onBack={() => dispatch({ type: "NAVIGATE_TO_ANALYSIS" })}
+          onBack={() => dispatch({ type: "NAVIGATE_TO_LIBRARY" })}
           onProjectAdded={(project) => dispatch({ type: "PROJECT_ADDED", payload: project })}
           onProjectUpdated={(project) => dispatch({ type: "PROJECT_UPDATED", payload: project })}
           onProjectDeleted={(projectId) => dispatch({ type: "PROJECT_DELETED", payload: projectId })}
           onViewHistory={(projectId) => dispatch({ type: "OPEN_HISTORY_DRAWER_FOR_PROJECT", payload: projectId })}
         />
+      ) : state.currentPage === "library" ? (
+        <AssetLibraryPage
+          assetLibrary={state.assetLibrary}
+          upload={upload}
+          analysis={analysis}
+          prompt={prompt}
+          history={history}
+          activeHistoryIdx={activeHistoryIdx}
+          projectsList={state.projects.list}
+          onSelectAsset={handleSelectAsset}
+          onFilterProject={(id) => dispatch({ type: "SET_ASSET_FILTER_PROJECT", payload: id })}
+          onFilterType={(t) => dispatch({ type: "SET_ASSET_FILTER_TYPE", payload: t })}
+          onSortOrder={(o) => dispatch({ type: "SET_ASSET_SORT_ORDER", payload: o })}
+          onUploadClick={() => uploadInputRef.current?.click()}
+          onDeleteAsset={handleDeleteAsset}
+          onRenameAsset={handleRenameAsset}
+          onAnalyze={handleAnalyze}
+          onPromptChange={handlePromptChange}
+          onQuickTag={handleQuickTag}
+          onResetPrompt={() => dispatch({ type: "RESET_PROMPT" })}
+          onSelectHistoryTab={(i) => dispatch({ type: "SELECT_HISTORY_TAB", payload: i })}
+        />
       ) : (
-        /* Main Analysis Content */
+        /* Legacy Analysis Page — RESTORE_FROM_HISTORY 仍跳转此页 */
         <main
           className={`flex-1 p-4 transition-opacity ${!isConfigured && !state.configPanelOpen ? "opacity-40 pointer-events-none" : ""}`}
         >
@@ -1988,12 +2626,16 @@ export default function App() {
             {/* Left: Video area */}
             <div className="lg:col-span-2 flex flex-col gap-3">
               {upload.phase === "done" ? (
-                <VideoPlayer
-                  src={upload.signedPlayUrl}
-                  filename={upload.file?.name}
-                  fileSize={upload.file?.size}
-                  onError={handleVideoError}
-                />
+                upload.isImage ? (
+                  <ImagePreview src={upload.signedPlayUrl} filename={upload.file?.name} />
+                ) : (
+                  <VideoPlayer
+                    src={upload.signedPlayUrl}
+                    filename={upload.file?.name}
+                    fileSize={upload.file?.size}
+                    onError={handleVideoError}
+                  />
+                )
               ) : (
                 <UploadZone
                   onFilesSelected={handleFilesSelected}
@@ -2001,7 +2643,6 @@ export default function App() {
                   onClearError={() => dispatch({ type: "RESET_UPLOAD" })}
                 />
               )}
-              {/* Project selector — shown below video/upload zone, hidden only during upload */}
               {upload.phase !== "uploading" && (
                 <ProjectSelector
                   projectsList={state.projects.list}
@@ -2027,10 +2668,10 @@ export default function App() {
               )}
               {upload.phase === "done" && (
                 <button
-                  onClick={() => dispatch({ type: "RESET_UPLOAD" })}
+                  onClick={() => dispatch({ type: "NAVIGATE_TO_LIBRARY" })}
                   className="text-sm text-gray-400 hover:text-gray-600 underline self-start"
                 >
-                  重新上传视频
+                  返回资产库
                 </button>
               )}
             </div>
@@ -2050,7 +2691,6 @@ export default function App() {
                 disabled={!canAnalyze}
               />
 
-              {/* Analysis error / timeout inline feedback */}
               {(analysis.status === "error" || analysis.status === "timeout") && (
                 <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm text-red-700">
                   ⚠️ {analysis.errorMessage}
@@ -2071,17 +2711,9 @@ export default function App() {
                 onSelect={(i) => dispatch({ type: "SELECT_HISTORY_TAB", payload: i })}
               />
               {isStreaming ? (
-                <ResultCard
-                  result={null}
-                  streamBuffer={analysis.streamBuffer}
-                  isStreaming
-                />
+                <ResultCard result={null} streamBuffer={analysis.streamBuffer} isStreaming />
               ) : (
-                <ResultCard
-                  result={history[activeHistoryIdx]}
-                  streamBuffer=""
-                  isStreaming={false}
-                />
+                <ResultCard result={history[activeHistoryIdx]} streamBuffer="" isStreaming={false} />
               )}
             </div>
           )}
@@ -2101,3 +2733,44 @@ export default function App() {
     </div>
   );
 }
+
+// Named exports for testing — 不改变任何运行时行为，仅让测试文件可以按名导入
+export {
+  // 纯工具函数（无副作用，最容易测）
+  buildOSSObjectKey,
+  formatElapsed,
+  formatFileSize,
+  parseInline,
+  renderMarkdownLine,
+  // 状态管理
+  appReducer,
+  initialState,
+  // OSS 异步函数（需要 mock fetch）
+  generateOSSPresignedUrl,
+  saveAnalysisToOSS,
+  updateOSSIndex,
+  loadOSSHistory,
+  loadAllOSSHistory,
+  loadProjectsFromOSS,
+  saveProjectsToOSS,
+  // v3.0: 资产库工具函数
+  loadAssetManifest,
+  saveAssetManifest,
+  deleteOSSObject,
+  loadAllProjectManifests,
+  patchAssetInManifest,
+  // UI 组件
+  UploadZone,
+  QueuePanel,
+  HistoryDrawer,
+  ProjectSelector,
+  AnalysisButton,
+  ResultCard,
+  MarkdownRenderer,
+  ProjectManagementPage,
+  // v3.0: 资产库组件
+  AssetRenameModal,
+  AssetList,
+  AssetDetailPanel,
+  AssetLibraryPage,
+};

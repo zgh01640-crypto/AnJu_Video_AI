@@ -54,7 +54,7 @@
         "oss:HeadObject"
       ],
       "Resource": [
-        "acs:oss:*:*:<your-bucket-name>/videos/*"
+        "acs:oss:*:*:qwen-video-analysis-001/videos/*"
       ]
     }
   ]
