@@ -1988,7 +1988,7 @@ function AssetRenameModal({ asset, onSave, onCancel }) {
 }
 
 // --- Asset List (left panel) ---
-function AssetList({ assets, selectedAssetId, filterProjectId, filterType, sortOrder, projectsList, onSelect, onFilterProject, onFilterType, onSortOrder, onUploadClick, onDelete, onRename }) {
+function AssetList({ assets, selectedAssetId, filterProjectId, filterType, sortOrder, projectsList, onSelect, onFilterProject, onFilterType, onSortOrder, onUploadClick, onDelete, onRename, uploadProjectId, onUploadProjectChange }) {
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
   let filtered = assets;
@@ -2003,12 +2003,25 @@ function AssetList({ assets, selectedAssetId, filterProjectId, filterType, sortO
       <div className="px-3 py-2 border-b border-gray-100 flex flex-col gap-2">
         <div className="flex items-center justify-between gap-2">
           <span className="text-sm font-semibold text-gray-700">资产库</span>
-          <button
-            onClick={onUploadClick}
-            className="text-xs px-3 py-1.5 bg-blue-700 text-white rounded-lg hover:bg-blue-800 font-medium"
-          >
-            + 上传
-          </button>
+          <div className="flex items-center gap-1.5">
+            {projectsList.length > 0 && (
+              <select
+                value={uploadProjectId || ""}
+                onChange={e => onUploadProjectChange(e.target.value || null)}
+                className="text-xs border border-gray-200 rounded px-1.5 py-1 bg-white text-gray-700 focus:outline-none"
+                title="上传到项目"
+              >
+                <option value="">未分类</option>
+                {projectsList.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            )}
+            <button
+              onClick={onUploadClick}
+              className="text-xs px-3 py-1.5 bg-blue-700 text-white rounded-lg hover:bg-blue-800 font-medium"
+            >
+              + 上传
+            </button>
+          </div>
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <select
@@ -2185,7 +2198,7 @@ function AssetDetailPanel({ asset, upload, analysis, prompt, history, activeHist
 }
 
 // --- Asset Library Page (main container) ---
-function AssetLibraryPage({ assetLibrary, upload, analysis, prompt, history, activeHistoryIdx, projectsList, onSelectAsset, onFilterProject, onFilterType, onSortOrder, onUploadClick, onDeleteAsset, onRenameAsset, onAnalyze, onPromptChange, onQuickTag, onResetPrompt, onSelectHistoryTab }) {
+function AssetLibraryPage({ assetLibrary, upload, analysis, prompt, history, activeHistoryIdx, projectsList, onSelectAsset, onFilterProject, onFilterType, onSortOrder, onUploadClick, onDeleteAsset, onRenameAsset, onAnalyze, onPromptChange, onQuickTag, onResetPrompt, onSelectHistoryTab, queue, selectedProjectId, onSelectProject }) {
   const [renameTarget, setRenameTarget] = useState(null);
 
   const selectedAsset = assetLibrary.assets.find(a => a.id === assetLibrary.selectedAssetId) || null;
@@ -2213,7 +2226,19 @@ function AssetLibraryPage({ assetLibrary, upload, analysis, prompt, history, act
           onUploadClick={onUploadClick}
           onDelete={onDeleteAsset}
           onRename={asset => setRenameTarget(asset)}
+          uploadProjectId={selectedProjectId}
+          onUploadProjectChange={onSelectProject}
         />
+        {queue && queue.items.length > 0 && (
+          <div className="border-t border-gray-100 shrink-0">
+            <QueuePanel
+              items={queue.items}
+              activeObjectKey={null}
+              onClear={null}
+              onSwitch={null}
+            />
+          </div>
+        )}
       </div>
 
       {/* Right: Detail panel (65%) */}
@@ -2616,6 +2641,9 @@ export default function App() {
           onQuickTag={handleQuickTag}
           onResetPrompt={() => dispatch({ type: "RESET_PROMPT" })}
           onSelectHistoryTab={(i) => dispatch({ type: "SELECT_HISTORY_TAB", payload: i })}
+          queue={queue}
+          selectedProjectId={state.selectedProjectId}
+          onSelectProject={(id) => dispatch({ type: "SET_SELECTED_PROJECT", payload: id })}
         />
       ) : (
         /* Legacy Analysis Page — RESTORE_FROM_HISTORY 仍跳转此页 */
