@@ -14,6 +14,19 @@ const MAX_PROMPT_CHARS = 500;
 const QWEN_ENDPOINT =
   "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 
+function getOssStatusDot(ossStatus) {
+  if (ossStatus === "loaded") return { color: "#4ade80", title: "OSS 已连接" };
+  if (ossStatus === "error") return { color: "#f87171", title: "OSS 连接失败" };
+  return { color: "#94a3b8", title: "OSS 状态未知" };
+}
+
+function getQwenStatusDot(qwenConnStatus) {
+  if (qwenConnStatus === "ok") return { color: "#4ade80", title: "AI 模型已连接" };
+  if (qwenConnStatus === "error") return { color: "#f87171", title: "AI 模型连接失败" };
+  if (qwenConnStatus === "checking") return { color: "#facc15", title: "AI 模型连接中…" };
+  return { color: "#94a3b8", title: "AI 模型状态未知" };
+}
+
 const QUICK_TAGS = [
   { label: "安全隐患", appendText: "，并指出画面中是否存在安全隐患" },
   { label: "人员数量", appendText: "，统计视频中出现的施工人员数量" },
@@ -371,6 +384,7 @@ const initialState = {
   historyDrawerOpen: false,
   historyDrawerProjectFilter: null,  // string | null，null = 不过滤
   persistError: "",
+  qwenConnStatus: "idle", // 'idle'|'checking'|'ok'|'error'
 
   // v1.1: 多视频上传队列
   queue: {
@@ -550,6 +564,13 @@ function appReducer(state, action) {
       return { ...state, persistError: action.payload.message };
     case "CLEAR_PERSIST_ERROR":
       return { ...state, persistError: "" };
+
+    case "QWEN_CONN_CHECKING":
+      return { ...state, qwenConnStatus: "checking" };
+    case "QWEN_CONN_OK":
+      return { ...state, qwenConnStatus: "ok" };
+    case "QWEN_CONN_ERROR":
+      return { ...state, qwenConnStatus: "error" };
 
     // ===== v1.1: HISTORY DRAWER ACTIONS =====
     case "OSS_HISTORY_LOADING":
@@ -2355,6 +2376,13 @@ export default function App() {
     if (!isConfigured) return;
     dispatch({ type: "PROJECTS_LOADING" });
     dispatch({ type: "ASSET_LIBRARY_LOADING" });
+    dispatch({ type: "QWEN_CONN_CHECKING" });
+    // 并行：OSS 加载 + Qwen 连通性检测
+    fetch("https://dashscope.aliyuncs.com/compatible-mode/v1/models", {
+      headers: { Authorization: `Bearer ${state.config.qwenApiKey}` },
+    })
+      .then(r => dispatch({ type: r.ok ? "QWEN_CONN_OK" : "QWEN_CONN_ERROR" }))
+      .catch(() => dispatch({ type: "QWEN_CONN_ERROR" }));
     loadProjectsFromOSS(state.config)
       .then(list => {
         dispatch({ type: "PROJECTS_LOADED", payload: { list } });
@@ -2586,9 +2614,15 @@ export default function App() {
         <div className="flex items-center gap-4">
           {isConfigured && (
             <div className="hidden sm:flex items-center gap-3 text-xs text-blue-200">
-              <span title="AI 分析模型">🤖 qwen-vl-plus</span>
+              <span title={getQwenStatusDot(state.qwenConnStatus).title} className="flex items-center gap-1">
+                🤖 qwen-vl-plus
+                <span style={{ width: 7, height: 7, borderRadius: "50%", background: getQwenStatusDot(state.qwenConnStatus).color, display: "inline-block", flexShrink: 0 }} />
+              </span>
               <span className="text-blue-500">|</span>
-              <span title="OSS 存储" className="max-w-[180px] truncate">🗄 {state.config.ossRegion}</span>
+              <span title={getOssStatusDot(state.ossHistory.status).title} className="flex items-center gap-1 max-w-[180px]">
+                <span className="truncate">🗄 {state.config.ossRegion}</span>
+                <span style={{ width: 7, height: 7, borderRadius: "50%", background: getOssStatusDot(state.ossHistory.status).color, display: "inline-block", flexShrink: 0 }} />
+              </span>
             </div>
           )}
           {isConfigured && (
